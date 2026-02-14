@@ -1,0 +1,49 @@
+# Environment
+.env
+.venv/
+venv/
+env/
+
+# Data (track with DVC, not git)
+data/raw/*
+data/processed/*
+data/features/*
+!data/raw/.gitkeep
+!data/processed/.gitkeep
+!data/features/.gitkeep
+
+# External data OK to commit (small CSVs)
+# data/external/ is tracked
+
+# Database files
+*.db
+*.sqlite3
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
+
+# MLflow
+mlruns/
+experiments/mlflow_runs/
+
+# Outputs (regenerable)
+*.png
+*.csv
+!data/external/*.csv
+
+# Notebooks checkpoints
+.ipynb_checkpoints/
