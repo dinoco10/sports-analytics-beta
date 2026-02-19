@@ -18,12 +18,35 @@ Usage:
 import sys, os, argparse
 import pandas as pd
 import numpy as np
+from datetime import date as date_type
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 from sqlalchemy import text
 from src.storage.database import engine
 import requests, time
+
+
+# ═══════════════════════════════════════════════════════════════
+# VETERAN RESILIENCE OVERRIDES
+# ═══════════════════════════════════════════════════════════════
+
+# Players who historically defy aging curves.
+# Factor: 0.0 = completely immune | 0.5 = half the penalty | 1.0 = full penalty (default)
+# Update annually. These are manually curated — data auto-detection handles the rest.
+AGELESS_VETERANS = {
+    # Pitchers — elite mechanics, conditioning, or deceptive stuff that ages slowly
+    "Justin Verlander":  0.20,   # Defied aging after TJ; extreme outlier
+    "Max Scherzer":      0.35,   # Elite competitor; historically above-curve
+    "Zack Greinke":      0.40,   # Deception-based, not velocity-dependent
+    "Rich Hill":         0.30,   # Curveball dependent; aged remarkably slowly
+    "Clayton Kershaw":   0.40,   # When healthy, still elite despite age
+    "Adam Wainwright":   0.50,   # Good comp reference even if retired
+    # Hitters — rare physical specimens or elite plate discipline
+    "David Ortiz":       0.30,   # Historical: literally improved into late 30s
+    "Albert Pujols":     0.45,   # Historical: held up longer than average decline
+    # Add active players here as they establish themselves as anomalies
+}
 
 MLB = "https://statsapi.mlb.com/api/v1"
 
@@ -69,6 +92,78 @@ def hitter_aging_adjustment(age):
     elif age <= 35: return -0.020  # Significant
     elif age <= 37: return -0.030  # Steep
     else:           return -0.045  # Cliff
+
+
+def calculate_age_midseason(birth_date_str, season=2026):
+    """
+    Calculate a player's age as of July 1st of the given season.
+
+    Why July 1? It's the approximate midpoint of an MLB season. A player
+    born in December 1990 turns 36 in Dec 2026 — but for the whole first
+    half of the season they're still 35. July 1 splits the difference fairly.
+
+    Without this, anyone born Nov-Dec gets over-penalized by a full year.
+    """
+    if pd.isna(birth_date_str):
+        return 28  # Safe default if birth date missing
+    try:
+        bd = pd.to_datetime(birth_date_str).date()
+        midseason = date_type(season, 7, 1)
+        return (midseason - bd).days // 365
+    except Exception:
+        return 28
+
+
+def compute_resilience_factor(player_name, player_seasons, age, role):
+    """
+    How much of the aging penalty should we apply to THIS specific player?
+
+    Returns a multiplier between 0.0 and 1.0:
+      0.0 → apply 0% of normal aging penalty (completely immune)
+      0.5 → apply 50% of normal aging penalty
+      1.0 → apply full aging penalty (default for most players)
+
+    Two sources, in priority order:
+    1. Manual override: AGELESS_VETERANS dict — known historical anomalies
+    2. Auto-detection: If a player 33+ is improving vs 2+ years ago, soften the hit
+
+    The auto-detection logic: if someone is getting BETTER with age (FIP dropping,
+    wOBA rising), we shouldn't simultaneously punish them for being old.
+    """
+    # 1. Manual override — exact or partial name match
+    for veteran_name, factor in AGELESS_VETERANS.items():
+        if veteran_name.lower() in player_name.lower():
+            return factor
+
+    # 2. Auto-detect meaningful upward trends only for players 33+
+    if age < 33:
+        return 1.0  # Young players: assume they follow the normal curve
+
+    sorted_seasons = player_seasons.sort_values('season')
+    if len(sorted_seasons) < 2:
+        return 1.0  # Need at least 2 seasons to detect a trend
+
+    oldest = sorted_seasons.iloc[0]
+    newest = sorted_seasons.iloc[-1]
+
+    if role in ('SP', 'RP'):
+        # Need meaningful IP for both endpoints
+        if oldest['ip'] < 10 or newest['ip'] < 10:
+            return 1.0
+        # Lower FIP = better. improvement > 0 means FIP dropped = player is improving
+        improvement = oldest['fip'] - newest['fip']
+        if improvement >= 0.50:   return 0.40   # Strong improvement → 60% softer curve
+        elif improvement >= 0.25: return 0.65   # Moderate improvement → 35% softer
+        return 1.0
+
+    else:  # Hitter
+        if oldest['pa'] < 50 or newest['pa'] < 50:
+            return 1.0
+        # Higher wOBA = better. improvement > 0 means wOBA rose = player is improving
+        improvement = newest['woba'] - oldest['woba']
+        if improvement >= 0.025:   return 0.40
+        elif improvement >= 0.015: return 0.65
+        return 1.0
 
 
 def playing_time_adjustment(age, role):
@@ -206,11 +301,8 @@ def project_pitcher(player_seasons, league_avg_era=4.20, league_avg_fip=4.20):
     birth_date = player_seasons.iloc[0]['birth_date']
     role = player_seasons.iloc[-1]['role']  # Most recent role
 
-    # Age in 2026
-    if pd.notna(birth_date):
-        age_2026 = 2026 - pd.to_datetime(birth_date).year
-    else:
-        age_2026 = 28  # Default assumption
+    # Age as of July 1, 2026 (midseason) — more accurate than birth year alone
+    age_2026 = calculate_age_midseason(birth_date)
 
     # Marcel weights
     year_weights = {2025: 5, 2024: 4, 2023: 3}
@@ -258,8 +350,11 @@ def project_pitcher(player_seasons, league_avg_era=4.20, league_avg_fip=4.20):
     proj_era = proj_era * regression_factor + league_avg_era * (1 - regression_factor)
     proj_fip = proj_fip * regression_factor + league_avg_fip * (1 - regression_factor)
 
-    # Aging adjustment
-    era_aging = pitcher_aging_adjustment(age_2026)
+    # Aging adjustment — softened for veteran outliers
+    # resilience_factor: how much of the normal aging penalty to actually apply
+    resilience = compute_resilience_factor(name, player_seasons, age_2026, role)
+    era_aging_raw = pitcher_aging_adjustment(age_2026)
+    era_aging = era_aging_raw * resilience
     proj_era += era_aging
     proj_fip += era_aging * 0.7  # FIP ages slightly less than ERA
 
@@ -288,6 +383,8 @@ def project_pitcher(player_seasons, league_avg_era=4.20, league_avg_fip=4.20):
         'proj_ip': round(proj_ip, 0),
         'proj_war': round(proj_war, 1),
         'era_aging_adj': round(era_aging, 2),
+        'era_aging_raw': round(era_aging_raw, 2),
+        'resilience_factor': round(resilience, 2),  # 1.0 = normal curve, <1.0 = veteran exemption
         'regression_factor': round(regression_factor, 2),
     }
 
@@ -301,10 +398,7 @@ def project_hitter(player_seasons, league_avg_woba=0.310):
     mlb_id = player_seasons.iloc[0]['mlb_player_id']
     birth_date = player_seasons.iloc[0]['birth_date']
 
-    if pd.notna(birth_date):
-        age_2026 = 2026 - pd.to_datetime(birth_date).year
-    else:
-        age_2026 = 27
+    age_2026 = calculate_age_midseason(birth_date)
 
     year_weights = {2025: 5, 2024: 4, 2023: 3}
 
@@ -343,8 +437,10 @@ def project_hitter(player_seasons, league_avg_woba=0.310):
     regression_factor = min(total_pa / 1500, 1.0)
     proj_woba = proj_woba * regression_factor + league_avg_woba * (1 - regression_factor)
 
-    # Aging
-    woba_aging = hitter_aging_adjustment(age_2026)
+    # Aging — softened for veteran outliers
+    resilience = compute_resilience_factor(name, player_seasons, age_2026, 'hitter')
+    woba_aging_raw = hitter_aging_adjustment(age_2026)
+    woba_aging = woba_aging_raw * resilience
     proj_woba += woba_aging
 
     # Projected PA
@@ -372,32 +468,44 @@ def project_hitter(player_seasons, league_avg_woba=0.310):
         'proj_pa': round(proj_pa, 0),
         'proj_war': round(proj_war, 1),
         'woba_aging_adj': round(woba_aging, 3),
+        'woba_aging_raw': round(woba_aging_raw, 3),
+        'resilience_factor': round(resilience, 2),
         'regression_factor': round(regression_factor, 2),
     }
 
 
 # ═══════════════════════════════════════════════════════════════
-# RUN ALL PROJECTIONS
+# PUBLIC API — used by roster_impact.py and power_rankings.py
 # ═══════════════════════════════════════════════════════════════
 
-def run_projections(team_filter=None, player_filter=None):
-    """Project all players and aggregate by current 2026 team."""
+def get_all_projections(verbose=True):
+    """
+    Run Marcel projections for all players and assign to their 2026 teams.
 
-    print("=" * 70)
-    print("2026 PLAYER PROJECTIONS (Marcel Method + Aging Curves)")
-    print("=" * 70)
+    This is the public interface that other modules import. It separates the
+    pure computation from the display logic in run_projections().
 
-    # Load multi-year data
-    print("\nLoading 2023-2025 stats from database...")
+    Args:
+        verbose: if True, prints progress (used by run_projections).
+                 Set to False when called from roster_impact or power_rankings.
+
+    Returns:
+        p_df: DataFrame of pitcher projections with 'current_team' column
+        h_df: DataFrame of hitter projections with 'current_team' column
+    """
+    if verbose:
+        print("\nLoading 2023-2025 stats from database...")
     pitchers_raw = load_pitcher_multi_year()
     hitters_raw = load_hitter_multi_year()
-    print(f"  Pitcher-seasons: {len(pitchers_raw)}")
-    print(f"  Hitter-seasons:  {len(hitters_raw)}")
+    if verbose:
+        print(f"  Pitcher-seasons: {len(pitchers_raw)}")
+        print(f"  Hitter-seasons:  {len(hitters_raw)}")
 
-    # Get current rosters
-    print("\nFetching current 2026 rosters...")
+    # Fetch current 2026 rosters to assign each player to their current team
+    if verbose:
+        print("\nFetching current 2026 rosters...")
     teams_data = api_get("teams", {"sportId": 1, "season": 2026})
-    roster_map = {}  # mlb_player_id -> current_team
+    roster_map = {}  # mlb_player_id (int) -> current team name
 
     for t in teams_data.get("teams", []):
         roster = api_get(f"teams/{t['id']}/roster", {"rosterType": "40Man", "season": 2026})
@@ -407,30 +515,52 @@ def run_projections(team_filter=None, player_filter=None):
                 roster_map[pid] = t["name"]
         time.sleep(0.2)
 
-    print(f"  Players on 2026 rosters: {len(roster_map)}")
+    if verbose:
+        print(f"  Players on 2026 rosters: {len(roster_map)}")
 
-    # Project pitchers
-    print("\nProjecting pitchers...")
+    # Project each pitcher (Marcel + aging + resilience)
+    if verbose:
+        print("\nProjecting pitchers...")
     pitcher_projections = []
     for pid, group in pitchers_raw.groupby('mlb_player_id'):
         proj = project_pitcher(group)
         if proj:
-            proj['current_team'] = roster_map.get(pid, 'Free Agent')
+            proj['current_team'] = roster_map.get(int(pid), 'Free Agent')
             pitcher_projections.append(proj)
 
-    p_df = pd.DataFrame(pitcher_projections)
-    print(f"  Projected {len(p_df)} pitchers")
-
-    # Project hitters
-    print("Projecting hitters...")
+    # Project each hitter
+    if verbose:
+        print("Projecting hitters...")
     hitter_projections = []
     for pid, group in hitters_raw.groupby('mlb_player_id'):
         proj = project_hitter(group)
         if proj:
-            proj['current_team'] = roster_map.get(pid, 'Free Agent')
+            proj['current_team'] = roster_map.get(int(pid), 'Free Agent')
             hitter_projections.append(proj)
 
+    p_df = pd.DataFrame(pitcher_projections)
     h_df = pd.DataFrame(hitter_projections)
+
+    if verbose:
+        print(f"  Projected {len(p_df)} pitchers, {len(h_df)} hitters")
+
+    return p_df, h_df
+
+
+# ═══════════════════════════════════════════════════════════════
+# RUN ALL PROJECTIONS (display + CSV output)
+# ═══════════════════════════════════════════════════════════════
+
+def run_projections(team_filter=None, player_filter=None):
+    """Project all players, display results, save CSVs."""
+
+    print("=" * 70)
+    print("2026 PLAYER PROJECTIONS (Marcel Method + Aging Curves)")
+    print("=" * 70)
+
+    # Core computation lives in get_all_projections()
+    p_df, h_df = get_all_projections(verbose=True)
+    print(f"  Projected {len(p_df)} pitchers")
     print(f"  Projected {len(h_df)} hitters")
 
     # Filter if requested
@@ -449,7 +579,8 @@ def run_projections(team_filter=None, player_filter=None):
                 print(f"  Projected: {r['proj_era']:.2f} ERA | {r['proj_fip']:.2f} FIP | "
                       f"{r['proj_k_bb_pct']:.1f} K-BB%")
                 print(f"  Projected: {r['proj_ip']:.0f} IP | {r['proj_war']:.1f} WAR")
-                print(f"  Aging adj: {r['era_aging_adj']:+.2f} ERA | "
+                resilience_note = f" (veteran: {r['resilience_factor']:.0%} of normal curve)" if r['resilience_factor'] < 1.0 else ""
+                print(f"  Aging adj: {r['era_aging_adj']:+.2f} ERA{resilience_note} | "
                       f"Regression: {r['regression_factor']:.0%} confidence")
 
         if not h_df_show.empty:
@@ -462,7 +593,8 @@ def run_projections(team_filter=None, player_filter=None):
                 print(f"  Data: {r['years_of_data']} years, {r['total_pa_history']:.0f} career PA")
                 print(f"  Projected: {r['proj_woba']:.3f} wOBA | {r['proj_ops']:.3f} OPS")
                 print(f"  Projected: {r['proj_pa']:.0f} PA | {r['proj_war']:.1f} WAR")
-                print(f"  Aging adj: {r['woba_aging_adj']:+.003f} wOBA | "
+                resilience_note = f" (veteran: {r['resilience_factor']:.0%} of normal curve)" if r['resilience_factor'] < 1.0 else ""
+                print(f"  Aging adj: {r['woba_aging_adj']:+.003f} wOBA{resilience_note} | "
                       f"Regression: {r['regression_factor']:.0%} confidence")
         return p_df, h_df
 
