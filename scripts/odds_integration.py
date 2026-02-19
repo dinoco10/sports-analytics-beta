@@ -226,6 +226,14 @@ def parse_excel_odds() -> pd.DataFrame:
     for fpath in excel_files:
         # Extract year from filename like "mlb-odds-2021.xlsx"
         year = int(fpath.stem.split("-")[-1])
+
+        # Skip 2021 — the JSON file covers it with better data (FanDuel
+        # closing lines vs. SBRO single-source). Including both would
+        # create duplicate game_id entries in the odds table.
+        if year >= 2021:
+            print(f"  Skipping {fpath.name} (covered by JSON)")
+            continue
+
         print(f"  Parsing {fpath.name} (year={year}) …")
 
         df = pd.read_excel(fpath, header=0)
@@ -395,9 +403,15 @@ def step1_ingest():
         "home_ml", "away_ml", "vegas_home_prob", "vegas_away_prob",
         "sportsbook", "source",
     ]
-    # Only save rows that have a game_id match
+    # Only save rows that have a game_id match, deduplicate doubleheaders
+    # (same date + home team can match multiple DB games in doubleheaders;
+    # keep first occurrence per game_id to avoid inflating counts)
     save_df = odds_df.dropna(subset=["game_id"])[save_cols].copy()
     save_df["game_id"] = save_df["game_id"].astype(int)
+    dupes = save_df.duplicated(subset=["game_id"], keep="first").sum()
+    if dupes > 0:
+        print(f"  Dropping {dupes} duplicate game_id rows (doubleheaders)")
+    save_df = save_df.drop_duplicates(subset=["game_id"], keep="first")
 
     conn = sqlite3.connect(str(DB_PATH))
     save_df.to_sql("odds", conn, if_exists="replace", index=False)
