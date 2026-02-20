@@ -208,6 +208,68 @@ class HittingGameStats(Base):
 
 
 # ═══════════════════════════════════════════════════════════
+# STATCAST METRICS (Season-Level from Baseball Savant)
+# ═══════════════════════════════════════════════════════════
+
+class PlayerStatcastMetrics(Base):
+    """
+    Season-level Statcast metrics per player, sourced from pybaseball.
+    One row per player per season. Used as regression signals in Marcel projections.
+
+    Categories:
+    - Contact quality: exit velo, barrel rate, hard hit %, expected stats
+    - Plate discipline: K%, BB%, chase rate, whiff rate, zone contact
+    - Batted ball profile: GB/FB/LD rates, pull air rate
+    - BABIP for luck filtering
+    """
+    __tablename__ = "player_statcast_metrics"
+
+    id = Column(Integer, primary_key=True)
+    player_id = Column(Integer, ForeignKey("players.id"), nullable=False)
+    season = Column(Integer, nullable=False)
+
+    # Contact quality
+    avg_exit_velocity = Column(Float)      # Average exit velocity (mph)
+    barrel_rate = Column(Float)            # Barrels per batted ball event
+    hard_hit_rate = Column(Float)          # Balls 95+ mph / BBE
+    xwoba = Column(Float)                  # Expected weighted on-base average
+    xslg = Column(Float)                   # Expected slugging
+    xba = Column(Float)                    # Expected batting average
+    launch_angle_sweet_spot_pct = Column(Float)  # Balls 8-32 degrees / BBE
+
+    # Actual stats (for luck gap calculations)
+    babip = Column(Float)                  # Batting average on balls in play
+    woba = Column(Float)                   # Actual wOBA (to compare vs xwOBA)
+    slg = Column(Float)                    # Actual SLG (to compare vs xSLG)
+    ba = Column(Float)                     # Actual BA (to compare vs xBA)
+    hr_per_fb = Column(Float)              # HR / fly balls ratio
+
+    # Plate discipline
+    k_rate = Column(Float)                 # Strikeout rate
+    bb_rate = Column(Float)                # Walk rate
+    chase_rate = Column(Float)             # O-Swing% — swinging outside zone
+    whiff_rate = Column(Float)             # Swinging strike rate
+    z_contact_rate = Column(Float)         # Contact on strikes (elite 85%+)
+
+    # Batted ball profile
+    pull_air_rate = Column(Float)          # Pulled fly balls — best HR predictor
+    gb_rate = Column(Float)                # Ground ball %
+    fb_rate = Column(Float)                # Fly ball %
+    ld_rate = Column(Float)                # Line drive %
+
+    # Metadata
+    pa = Column(Integer)                   # Plate appearances (for min threshold)
+
+    __table_args__ = (
+        UniqueConstraint("player_id", "season", name="uq_statcast_player_season"),
+        Index("idx_statcast_season", "season"),
+    )
+
+    def __repr__(self):
+        return f"<Statcast {self.player_id} {self.season}: xwOBA={self.xwoba}>"
+
+
+# ═══════════════════════════════════════════════════════════
 # AGGREGATION & MODEL TABLES
 # ═══════════════════════════════════════════════════════════
 
