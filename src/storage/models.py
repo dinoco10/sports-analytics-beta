@@ -388,6 +388,36 @@ class PitcherPitchMetrics(Base):
 
 
 # ═══════════════════════════════════════════════════════════
+# ROSTER TRACKING
+# ═══════════════════════════════════════════════════════════
+
+class RosterSnapshot(Base):
+    """
+    Daily snapshot of a player's roster status.
+    One row per player per date. Tracks roster moves over time:
+    trades, DFA, IL stints, call-ups, etc.
+    """
+    __tablename__ = "roster_snapshots"
+
+    id = Column(Integer, primary_key=True)
+    player_id = Column(Integer, ForeignKey("players.id"), nullable=False)
+    team_id = Column(Integer, ForeignKey("teams.id"), nullable=False)
+    date = Column(Date, nullable=False)
+    status = Column(String(20), nullable=False)   # active, IL10, IL60, minors, DFA
+    roster_type = Column(String(20))               # 40Man, active
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    __table_args__ = (
+        UniqueConstraint("player_id", "date", name="uq_roster_player_date"),
+        Index("idx_roster_date", "date"),
+        Index("idx_roster_team_date", "team_id", "date"),
+    )
+
+    def __repr__(self):
+        return f"<RosterSnapshot player={self.player_id} team={self.team_id} {self.date} {self.status}>"
+
+
+# ═══════════════════════════════════════════════════════════
 # AGGREGATION & MODEL TABLES
 # ═══════════════════════════════════════════════════════════
 
