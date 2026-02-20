@@ -26,6 +26,7 @@ from src.storage.database import engine
 from config.settings import (
     POSITION_ADJUSTMENT_RUNS, LEAGUE_AVG_WOBA, LEAGUE_AVG_WOBA_SCALE,
     LEAGUE_AVG_R_PA, RUNS_PER_WIN, REPLACEMENT_LEVEL_WINS,
+    LEAGUE_AVG_STATCAST_HITTER, LEAGUE_AVG_STATCAST_PITCHER,
 )
 import requests, time
 
@@ -227,35 +228,40 @@ def load_statcast_multi_year():
     return df
 
 
-def compute_luck_filters(player_statcast):
+def compute_luck_filters(player_statcast, marcel_sc=None):
     """
     Calculate "luck filters" — gaps between expected and actual performance.
-    These are the core regression signals that tell us if a player was lucky/unlucky.
+    Now uses Marcel-weighted Statcast as the "true talent" baseline instead
+    of simple career averages. This is more accurate because Marcel accounts
+    for recency weighting and sample-size regression.
 
     A player with xwOBA >> wOBA had hard contact that didn't fall for hits.
     That's BABIP luck, not a skill change. Expect regression UPWARD.
 
-    Returns a dict with luck metrics for the most recent season available.
+    Args:
+        player_statcast: DataFrame of player's Statcast data (multi-year)
+        marcel_sc: dict from marcel_weight_statcast() — Marcel-weighted baselines.
+                   If None, falls back to simple career average (old behavior).
 
-    Key signals:
-    - babip_vs_career: negative = unlucky, expect bounce back
-    - xba_minus_ba: positive = unlucky (expected BA higher than actual)
-    - xslg_minus_slg: positive = unlucky power
-    - hr_per_fb_vs_norm: negative = HR due for regression up (league norm ~11-13%)
+    Returns a dict with luck metrics for the most recent season.
     """
     if player_statcast.empty:
         return {}
 
-    # Career averages (weighted by PA across available seasons)
-    career_babip = player_statcast['babip'].mean()
-    career_hr_per_fb = player_statcast['hr_per_fb'].mean()
+    # Use Marcel-weighted values as baseline if available, else simple average
+    if marcel_sc:
+        career_babip = marcel_sc.get('babip', player_statcast['babip'].mean())
+        career_hr_per_fb = marcel_sc.get('hr_per_fb', player_statcast['hr_per_fb'].mean())
+    else:
+        career_babip = player_statcast['babip'].mean()
+        career_hr_per_fb = player_statcast['hr_per_fb'].mean()
 
     # Most recent season's luck gaps
     recent = player_statcast.sort_values('season').iloc[-1]
 
     result = {}
 
-    # BABIP vs career average — if current BABIP is below career, expect regression up
+    # BABIP vs Marcel baseline — if current BABIP below true talent, expect bounce back
     if pd.notna(recent.get('babip')) and pd.notna(career_babip):
         result['babip_vs_career'] = round(recent['babip'] - career_babip, 3)
 
@@ -267,7 +273,7 @@ def compute_luck_filters(player_statcast):
     if pd.notna(recent.get('xslg')) and pd.notna(recent.get('slg')):
         result['xslg_minus_slg'] = round(recent['xslg'] - recent['slg'], 3)
 
-    # HR/FB vs career norm — league average is ~11-13%, if below career, expect regression up
+    # HR/FB vs Marcel baseline
     if pd.notna(recent.get('hr_per_fb')) and pd.notna(career_hr_per_fb):
         result['hr_per_fb_vs_career'] = round(recent['hr_per_fb'] - career_hr_per_fb, 3)
 
@@ -278,19 +284,19 @@ def compute_luck_filters(player_statcast):
     return result
 
 
-def statcast_adjustment(marcel_woba, player_statcast, luck_filters):
+def statcast_adjustment(marcel_woba, player_statcast, luck_filters,
+                        marcel_sc=None, trends=None):
     """
     Apply Statcast regression signals to adjust the Marcel base projection.
 
-    This is the key innovation: Marcel gives us a solid 3-year weighted average,
-    but it treats every .250 hitter the same. Statcast tells us WHICH .250 hitters
-    actually hit the ball hard (unlucky) vs which made weak contact (lucky).
+    Now uses Marcel-weighted Statcast values for quality thresholds (barrel rate,
+    chase rate) and separate trend analysis for direction signals.
 
     Adjustment rules (each capped to prevent extreme swings):
-    1. xwOBA >> wOBA AND BABIP below career → project upward (max +.020 wOBA)
-    2. Barrel rate + hard hit rate stable/improving → trust/boost projection
-    3. Pull air rate trending up → add HR upside (power development signal)
-    4. Chase rate increasing → flag risk, reduce projection (approach declining)
+    1. xwOBA >> wOBA AND BABIP below Marcel baseline → project upward (max +.020)
+    2. Marcel barrel rate vs league avg → trust/discount quality (max ±.010)
+    3. Pull air rate TREND → HR direction signal (max +.008)
+    4. Marcel chase rate vs league avg + TREND → discipline signal (max ±.010)
 
     Returns: wOBA adjustment value (positive = upside, negative = downside)
     """
@@ -298,82 +304,75 @@ def statcast_adjustment(marcel_woba, player_statcast, luck_filters):
         return 0.0
 
     adjustment = 0.0
-    recent = player_statcast.sort_values('season').iloc[-1]
+    if marcel_sc is None:
+        marcel_sc = {}
+    if trends is None:
+        trends = {}
 
     # --- RULE 1: xwOBA/BABIP luck correction ---
-    # If xwOBA is significantly higher than actual wOBA AND BABIP is depressed,
-    # the player was genuinely unlucky — not a skill issue
     xwoba_gap = luck_filters.get('xwoba_minus_woba', 0)
     babip_gap = luck_filters.get('babip_vs_career', 0)
 
     if xwoba_gap > 0.010 and babip_gap < -0.010:
-        # Both signals agree: unlucky. Weight by the gap size.
-        # Cap at +0.020 wOBA to avoid overreacting
         luck_adj = min(xwoba_gap * 0.5, 0.020)
         adjustment += luck_adj
     elif xwoba_gap < -0.010 and babip_gap > 0.010:
-        # Lucky — actual stats were inflated. Regress downward.
         luck_adj = max(xwoba_gap * 0.4, -0.015)
         adjustment += luck_adj
 
-    # --- RULE 2: Contact quality stability ---
-    # If barrel rate and hard hit rate are stable or improving across years,
-    # the underlying bat quality is real — trust the projection
-    if len(player_statcast) >= 2:
-        sorted_sc = player_statcast.sort_values('season')
-        recent_barrel = sorted_sc.iloc[-1].get('barrel_rate')
-        prev_barrel = sorted_sc.iloc[-2].get('barrel_rate')
+    # --- RULE 2: Marcel-weighted contact quality ---
+    # Use Marcel-weighted barrel rate (3-year stabilized) vs league avg
+    # This is more reliable than checking just one year's barrel rate
+    marcel_barrel = marcel_sc.get('barrel_rate')
+    if marcel_barrel is not None:
+        if marcel_barrel > 12.0:
+            # Elite barrel rate across 3 years = real power, trust projection
+            adjustment += 0.008
+        elif marcel_barrel < 5.0:
+            # Consistently poor contact = discount
+            adjustment -= 0.006
 
-        if pd.notna(recent_barrel) and pd.notna(prev_barrel):
-            barrel_trend = recent_barrel - prev_barrel
-            if barrel_trend > 1.0:
-                # Improving barrel rate = real power development (+0.005 to +0.010)
-                adjustment += min(barrel_trend * 0.003, 0.010)
-            elif barrel_trend < -2.0:
-                # Declining barrel rate = real skill erosion
-                adjustment += max(barrel_trend * 0.002, -0.008)
+    # Also check trend — is barrel rate improving or declining?
+    barrel_trend = trends.get('barrel_rate_trend', 0)
+    if barrel_trend > 1.5:
+        adjustment += min(barrel_trend * 0.003, 0.010)
+    elif barrel_trend < -2.0:
+        adjustment += max(barrel_trend * 0.002, -0.008)
 
     # --- RULE 3: Pull air rate trend (HR predictor) ---
-    # Pulled fly balls are the #1 predictor of future home runs.
-    # If a hitter is pulling more balls in the air, power is coming.
-    if len(player_statcast) >= 2:
-        sorted_sc = player_statcast.sort_values('season')
-        recent_pull = sorted_sc.iloc[-1].get('pull_air_rate')
-        prev_pull = sorted_sc.iloc[-2].get('pull_air_rate')
+    pull_trend = trends.get('pull_air_rate_trend', 0)
+    if pull_trend > 2.0:
+        adjustment += min(pull_trend * 0.002, 0.008)
 
-        if pd.notna(recent_pull) and pd.notna(prev_pull):
-            pull_trend = recent_pull - prev_pull
-            if pull_trend > 2.0:
-                # More pulled fly balls = HR upside
-                adjustment += min(pull_trend * 0.002, 0.008)
+    # --- RULE 4: Marcel-weighted chase rate + trend ---
+    # Marcel chase rate gives true talent discipline level.
+    # Trend tells us if discipline is improving or declining.
+    marcel_chase = marcel_sc.get('chase_rate')
+    if marcel_chase is not None:
+        if marcel_chase > 33.0:
+            # High chase hitter across 3 years = real discipline problem
+            adjustment -= 0.005
+        elif marcel_chase < 22.0:
+            # Elite discipline = trust the projection
+            adjustment += 0.003
 
-    # --- RULE 4: Chase rate risk ---
-    # Chase rate (O-Swing%) is the most stable discipline metric.
-    # If it's increasing, the hitter is chasing more pitches outside the zone.
-    # This is a REAL skill change, not noise. Reduce projection.
-    if len(player_statcast) >= 2:
-        sorted_sc = player_statcast.sort_values('season')
-        recent_chase = sorted_sc.iloc[-1].get('chase_rate')
-        prev_chase = sorted_sc.iloc[-2].get('chase_rate')
-
-        if pd.notna(recent_chase) and pd.notna(prev_chase):
-            chase_trend = recent_chase - prev_chase
-            if chase_trend > 2.0:
-                # Chasing more = approach deteriorating
-                adjustment -= min(chase_trend * 0.002, 0.010)
-            elif chase_trend < -2.0:
-                # Chasing less = approach improving (discipline breakout)
-                adjustment += min(abs(chase_trend) * 0.001, 0.005)
+    chase_trend = trends.get('chase_rate_trend', 0)
+    if chase_trend > 2.0:
+        adjustment -= min(chase_trend * 0.002, 0.010)
+    elif chase_trend < -2.0:
+        adjustment += min(abs(chase_trend) * 0.001, 0.005)
 
     # Final cap: never adjust more than +/- 0.030 wOBA
     adjustment = max(-0.030, min(0.030, adjustment))
     return round(adjustment, 3)
 
 
-def compute_scores(player_statcast, luck_filters, sc_adjustment):
+def compute_scores(player_statcast, luck_filters, sc_adjustment,
+                   marcel_sc=None, trends=None):
     """
     Compute bounce-back score and regression risk score (both 0-100).
-    Also identify the single most important stat driving the projection.
+    Now uses Marcel-weighted Statcast values for quality thresholds
+    and trends for direction signals.
 
     bounce_back_score: How much upside vs surface stats (high = buy low candidate)
     regression_risk_score: How much downside risk (high = sell high candidate)
@@ -386,11 +385,13 @@ def compute_scores(player_statcast, luck_filters, sc_adjustment):
     bounce_back = 50  # Neutral starting point
     regression_risk = 50
     indicators = {}  # stat_name -> weight (highest weight = key indicator)
+    if marcel_sc is None:
+        marcel_sc = {}
+    if trends is None:
+        trends = {}
 
     if not luck_filters and player_statcast.empty:
         return 50, 50, "insufficient_data"
-
-    recent = player_statcast.sort_values('season').iloc[-1] if not player_statcast.empty else {}
 
     # --- Luck signals (biggest impact on bounce-back score) ---
     xwoba_gap = luck_filters.get('xwoba_minus_woba', 0)
@@ -398,7 +399,7 @@ def compute_scores(player_statcast, luck_filters, sc_adjustment):
 
     # xwOBA gap: positive = unlucky = bounce-back candidate
     if xwoba_gap > 0.020:
-        bounce_back += min(xwoba_gap * 500, 25)  # Up to +25 points
+        bounce_back += min(xwoba_gap * 500, 25)
         indicators['xwoba_gap'] = abs(xwoba_gap) * 500
     elif xwoba_gap < -0.020:
         regression_risk += min(abs(xwoba_gap) * 500, 25)
@@ -412,51 +413,46 @@ def compute_scores(player_statcast, luck_filters, sc_adjustment):
         regression_risk += min(babip_gap * 300, 15)
         indicators['babip_vs_career'] = abs(babip_gap) * 300
 
-    # --- Contact quality signals ---
-    if pd.notna(recent.get('barrel_rate')):
-        barrel = recent['barrel_rate']
-        if barrel > 12:  # Elite barrel rate
+    # --- Contact quality signals (now using Marcel-weighted values) ---
+    # Marcel-weighted barrel rate is more stable than a single year's value
+    marcel_barrel = marcel_sc.get('barrel_rate') if marcel_sc else None
+    if marcel_barrel is not None:
+        if marcel_barrel > 12:
             bounce_back += 8
             indicators['barrel_rate'] = 8
-        elif barrel < 4:  # Poor contact quality
+        elif marcel_barrel < 4:
             regression_risk += 8
             indicators['barrel_rate'] = 8
 
-    if pd.notna(recent.get('hard_hit_rate')):
-        hh = recent['hard_hit_rate']
-        if hh > 45:  # Elite hard hit rate
+    marcel_hh = marcel_sc.get('hard_hit_rate') if marcel_sc else None
+    if marcel_hh is not None:
+        if marcel_hh > 45:
             bounce_back += 5
-        elif hh < 30:  # Weak contact
+        elif marcel_hh < 30:
             regression_risk += 5
 
-    # --- Discipline signals ---
-    if pd.notna(recent.get('chase_rate')):
-        chase = recent['chase_rate']
-        if chase > 35:  # High chase rate = real risk
+    # --- Discipline signals (Marcel-weighted) ---
+    marcel_chase = marcel_sc.get('chase_rate') if marcel_sc else None
+    if marcel_chase is not None:
+        if marcel_chase > 35:
             regression_risk += 10
             indicators['chase_rate'] = 10
-        elif chase < 25:  # Elite discipline
+        elif marcel_chase < 25:
             bounce_back += 5
             indicators['chase_rate'] = 5
 
-    if pd.notna(recent.get('z_contact_rate')):
-        z_contact = recent['z_contact_rate']
-        if z_contact > 88:  # Elite zone contact
+    marcel_zc = marcel_sc.get('z_contact_rate') if marcel_sc else None
+    if marcel_zc is not None:
+        if marcel_zc > 88:
             bounce_back += 5
-        elif z_contact < 78:  # Poor contact on strikes
+        elif marcel_zc < 78:
             regression_risk += 5
 
-    # --- Trend signals (if we have multi-year data) ---
-    if len(player_statcast) >= 2:
-        sorted_sc = player_statcast.sort_values('season')
-        recent_pull = sorted_sc.iloc[-1].get('pull_air_rate')
-        prev_pull = sorted_sc.iloc[-2].get('pull_air_rate')
-
-        if pd.notna(recent_pull) and pd.notna(prev_pull):
-            pull_trend = recent_pull - prev_pull
-            if pull_trend > 3:
-                bounce_back += 5
-                indicators['pull_air_trend'] = 5
+    # --- Trend signals (using compute_statcast_trends output) ---
+    pull_trend = trends.get('pull_air_rate_trend', 0) if trends else 0
+    if pull_trend > 3:
+        bounce_back += 5
+        indicators['pull_air_trend'] = 5
 
     # Incorporate the statcast adjustment direction
     if sc_adjustment > 0.010:
@@ -542,10 +538,118 @@ def load_pitcher_pitch_metrics():
     return df
 
 
-def compute_pitcher_luck_filters(pitcher_statcast):
+# ═══════════════════════════════════════════════════════════════
+# MARCEL-WEIGHT STATCAST METRICS
+# ═══════════════════════════════════════════════════════════════
+#
+# The Marcel Method applies to EVERYTHING, not just traditional stats.
+# A player's barrel rate, chase rate, xwOBA, etc. should also be
+# weighted 5/4/3 across 3 years and regressed toward league average.
+# This gives more stable inputs than using a single year's Statcast data.
+
+def marcel_weight_statcast(player_statcast_df, metrics, league_averages,
+                           sample_col='statcast_pa', full_season_sample=550):
+    """
+    Apply Marcel 5/4/3 weighting to a player's multi-year Statcast metrics,
+    then regress toward league average based on total sample size.
+
+    How it works (same Marcel logic as traditional stats):
+    1. For each Statcast metric (barrel rate, xwOBA, chase rate, etc.):
+       - Weight 2025 data × 5, 2024 × 4, 2023 × 3
+       - Also weight by PA within each year (more PA = more reliable)
+    2. Regress toward league average based on total career sample
+       - 3 full seasons (1650 PA) = no regression
+       - 1 season of 300 PA = heavy regression toward league average
+
+    Returns: dict of {metric_name: marcel_weighted_value}
+
+    Example: A hitter with barrel rates of 15%, 12%, 14% across 3 years
+    gets Marcel-weighted barrel rate of ~13.5% (recent-weighted),
+    then slightly regressed toward the 8.5% league average.
+    """
+    if player_statcast_df.empty:
+        return {m: league_averages.get(m, 0) for m in metrics}
+
+    year_weights = {2025: 5, 2024: 4, 2023: 3}
+    result = {}
+
+    # Total sample across all years (for regression calculation)
+    total_sample = player_statcast_df[sample_col].sum() if sample_col in player_statcast_df.columns else 0
+
+    for metric in metrics:
+        weighted_sum = 0.0
+        total_weight = 0.0
+
+        for _, row in player_statcast_df.iterrows():
+            season = row.get('season')
+            value = row.get(metric)
+            sample = row.get(sample_col, 0)
+
+            if pd.isna(value) or pd.isna(season):
+                continue
+
+            yr_w = year_weights.get(int(season), 0)
+            if yr_w == 0:
+                continue
+
+            # Weight by both year recency AND sample size within that year
+            pa_weight = min(sample / full_season_sample, 1.0) if pd.notna(sample) and sample > 0 else 0.5
+            effective_weight = yr_w * pa_weight
+
+            weighted_sum += value * effective_weight
+            total_weight += effective_weight
+
+        if total_weight > 0:
+            weighted_avg = weighted_sum / total_weight
+        else:
+            # No valid data — use league average
+            result[metric] = league_averages.get(metric, 0)
+            continue
+
+        # Regress toward league average based on total career sample
+        # 3 full seasons = full confidence, less data = more regression
+        regression_factor = min(total_sample / (full_season_sample * 3), 1.0)
+        league_avg = league_averages.get(metric, weighted_avg)
+        final = weighted_avg * regression_factor + league_avg * (1 - regression_factor)
+
+        result[metric] = round(final, 3)
+
+    return result
+
+
+def compute_statcast_trends(player_statcast_df, metrics):
+    """
+    Compute 2-year deltas for each Statcast metric.
+    Returns {metric + '_trend': recent_value - previous_value}.
+
+    Trends are the CHANGE signal on top of the Marcel-weighted base.
+    Marcel tells you "what is this player's true talent level?"
+    Trends tell you "is that talent level getting better or worse?"
+
+    Example: A pitcher with Marcel-weighted barrel_rate_against of 7.0%
+    but a trend of +2.5% is GETTING WORSE despite looking elite on average.
+    """
+    if len(player_statcast_df) < 2:
+        return {}
+
+    sorted_df = player_statcast_df.sort_values('season')
+    recent = sorted_df.iloc[-1]
+    previous = sorted_df.iloc[-2]
+
+    trends = {}
+    for metric in metrics:
+        recent_val = recent.get(metric)
+        prev_val = previous.get(metric)
+        if pd.notna(recent_val) and pd.notna(prev_val):
+            trends[f'{metric}_trend'] = round(recent_val - prev_val, 3)
+
+    return trends
+
+
+def compute_pitcher_luck_filters(pitcher_statcast, marcel_sc=None):
     """
     Calculate pitcher "luck filters" — gaps between expected and actual.
-    These tell us if a pitcher's ERA was real or driven by BABIP/HR luck.
+    Now uses Marcel-weighted Statcast as the "true talent" baseline.
 
     Key signals:
     - era_minus_xera: positive = pitcher was UNLUCKY (ERA > xERA, expect improvement)
@@ -556,9 +660,14 @@ def compute_pitcher_luck_filters(pitcher_statcast):
     if pitcher_statcast.empty:
         return {}
 
-    career_babip = pitcher_statcast['babip_against'].mean()
-    career_hr_fb = pitcher_statcast['hr_per_fb'].mean()
-    league_hr_fb = 0.12  # League average HR/FB rate
+    # Use Marcel-weighted baselines if available
+    if marcel_sc:
+        career_babip = marcel_sc.get('babip_against', pitcher_statcast['babip_against'].mean())
+        career_hr_fb = marcel_sc.get('hr_per_fb', pitcher_statcast['hr_per_fb'].mean())
+    else:
+        career_babip = pitcher_statcast['babip_against'].mean()
+        career_hr_fb = pitcher_statcast['hr_per_fb'].mean()
+    league_hr_fb = 0.12
 
     recent = pitcher_statcast.sort_values('season').iloc[-1]
     result = {}
@@ -588,7 +697,7 @@ def compute_pitcher_luck_filters(pitcher_statcast):
 
 
 def pitcher_statcast_adjustment(marcel_era, pitcher_statcast, luck_filters,
-                                pitch_metrics=None):
+                                pitch_metrics=None, marcel_sc=None, trends=None):
     """
     Apply Statcast regression signals to adjust the Marcel ERA projection.
 
@@ -610,79 +719,57 @@ def pitcher_statcast_adjustment(marcel_era, pitcher_statcast, luck_filters,
         return 0.0
 
     adjustment = 0.0
-    recent = pitcher_statcast.sort_values('season').iloc[-1]
+    if marcel_sc is None:
+        marcel_sc = {}
+    if trends is None:
+        trends = {}
 
     # --- RULE 1: ERA/xERA + BABIP luck correction ---
-    # If ERA >> xERA AND BABIP above career average, the pitcher was unlucky.
-    # Regress ERA downward (negative adjustment = improvement).
     era_gap = luck_filters.get('era_minus_xera', 0)
     babip_gap = luck_filters.get('babip_vs_career', 0)
 
     if era_gap > 0.30 and babip_gap > 0.010:
-        # ERA inflated by BABIP luck — project improvement
-        # Weight: 40% of the ERA gap, capped at -0.40 (don't over-correct)
         luck_adj = max(-era_gap * 0.4, -0.40)
         adjustment += luck_adj
     elif era_gap < -0.30 and babip_gap < -0.010:
-        # ERA deflated by lucky BABIP — project regression upward
         luck_adj = min(abs(era_gap) * 0.35, 0.35)
         adjustment += luck_adj
 
-    # --- RULE 2: Contact suppression quality ---
-    # If barrel rate and hard hit rate are low, the pitching is real.
-    # If they're high despite good ERA, the ERA is borrowed time.
-    if pd.notna(recent.get('barrel_rate_against')):
-        barrel = recent['barrel_rate_against']
-        if barrel < 5.5:
-            # Elite contact suppression — trust the ERA, slight improvement
+    # --- RULE 2: Marcel-weighted contact suppression quality ---
+    marcel_barrel = marcel_sc.get('barrel_rate_against')
+    if marcel_barrel is not None:
+        if marcel_barrel < 5.5:
             adjustment -= 0.10
-        elif barrel > 9.0:
-            # Hitters barreling this pitcher — ERA will catch up
+        elif marcel_barrel > 9.0:
             adjustment += 0.15
 
-    if pd.notna(recent.get('hard_hit_rate_against')):
-        hh = recent['hard_hit_rate_against']
-        if hh < 32:
+    marcel_hh = marcel_sc.get('hard_hit_rate_against')
+    if marcel_hh is not None:
+        if marcel_hh < 32:
             adjustment -= 0.05
-        elif hh > 42:
+        elif marcel_hh > 42:
             adjustment += 0.10
 
-    # --- RULE 3: Pull air rate against trend ---
-    # Pull air rate against is the most underrated pitcher stat.
-    # 66% of HRs come from pulled fly balls. If a pitcher's pull_air_rate_against
-    # is trending up, home run trouble is coming even if HR/FB looks fine now.
-    if len(pitcher_statcast) >= 2:
-        sorted_ps = pitcher_statcast.sort_values('season')
-        recent_pull = sorted_ps.iloc[-1].get('pull_air_rate_against')
-        prev_pull = sorted_ps.iloc[-2].get('pull_air_rate_against')
+    # --- RULE 3: Pull air rate against TREND ---
+    pull_trend = trends.get('pull_air_rate_against_trend', 0)
+    if pull_trend > 2.0:
+        adjustment += min(pull_trend * 0.04, 0.15)
+    elif pull_trend < -2.0:
+        adjustment -= min(abs(pull_trend) * 0.03, 0.10)
 
-        if pd.notna(recent_pull) and pd.notna(prev_pull):
-            pull_trend = recent_pull - prev_pull
-            if pull_trend > 2.0:
-                # More pulled fly balls allowed = HR trouble coming
-                adjustment += min(pull_trend * 0.04, 0.15)
-            elif pull_trend < -2.0:
-                # Fewer pulled fly balls = fewer HR coming
-                adjustment -= min(abs(pull_trend) * 0.03, 0.10)
-
-    # --- RULE 4: Swing & miss sustainability ---
-    # K-BB% is the single most predictive pitcher stat year-over-year.
-    # < 10% = heavy BABIP dependence (risky). > 20% = elite, trust the ERA.
-    k_bb = recent.get('k_minus_bb')
-    if pd.notna(k_bb):
-        if k_bb > 20:
-            # Elite swing & miss — ERA has a high floor
+    # --- RULE 4: Marcel-weighted swing & miss sustainability ---
+    marcel_k_bb = marcel_sc.get('k_minus_bb')
+    if marcel_k_bb is not None:
+        if marcel_k_bb > 20:
             adjustment -= 0.10
-        elif k_bb < 8:
-            # Very low strikeout-walk differential — BABIP dependent
+        elif marcel_k_bb < 8:
             adjustment += 0.15
 
-    # SwStr% as additional check (<8.6% = bottom 5 in the league)
-    swstr = recent.get('swstr_rate')
-    if pd.notna(swstr):
-        if swstr < 8.6:
+    marcel_swstr = marcel_sc.get('swstr_rate')
+    if marcel_swstr is not None:
+        if marcel_swstr < 8.6:
             adjustment += 0.08
-        elif swstr > 13.0:
+        elif marcel_swstr > 13.0:
             adjustment -= 0.05
 
     # --- RULE 5: Fastball velocity trend ---
@@ -710,7 +797,7 @@ def pitcher_statcast_adjustment(marcel_era, pitcher_statcast, luck_filters,
 
 
 def compute_pitcher_scores(pitcher_statcast, luck_filters, era_adj,
-                           pitch_metrics=None):
+                           pitch_metrics=None, marcel_sc=None, trends=None):
     """
     Compute three pitcher scores (all 0-100) plus flag indicators:
 
@@ -739,14 +826,20 @@ def compute_pitcher_scores(pitcher_statcast, luck_filters, era_adj,
     upside_factors = {}  # name -> weight
     key_pitch_name = "unknown"
 
+    if marcel_sc is None:
+        marcel_sc = {}
+    if trends is None:
+        trends = {}
+
     if pitcher_statcast.empty and not luck_filters:
         return 50, 50, 50, "insufficient_data", "insufficient_data", "unknown"
 
     recent = pitcher_statcast.sort_values('season').iloc[-1] if not pitcher_statcast.empty else {}
 
     # ── SUSTAINABILITY SIGNALS ──────────────────────────────
+    # Use Marcel-weighted values for level, trends for direction
     # K-BB% is king — the most stable pitcher metric year-over-year
-    k_bb = recent.get('k_minus_bb')
+    k_bb = marcel_sc.get('k_minus_bb', recent.get('k_minus_bb'))
     if pd.notna(k_bb):
         if k_bb > 20:
             sustainability += 20
@@ -761,7 +854,7 @@ def compute_pitcher_scores(pitcher_statcast, luck_filters, era_adj,
             risk_factors['very_low_k_bb_pct'] = 20
 
     # Barrel rate against — elite contact suppression = sustainable
-    barrel = recent.get('barrel_rate_against')
+    barrel = marcel_sc.get('barrel_rate_against', recent.get('barrel_rate_against'))
     if pd.notna(barrel):
         if barrel < 5.5:
             sustainability += 12
@@ -773,7 +866,7 @@ def compute_pitcher_scores(pitcher_statcast, luck_filters, era_adj,
             risk_factors['high_barrel_rate'] = 10
 
     # Ground ball rate — GB pitchers sustain better (fewer HR)
-    gb = recent.get('gb_rate')
+    gb = marcel_sc.get('gb_rate', recent.get('gb_rate'))
     if pd.notna(gb):
         if gb > 50:
             sustainability += 8
@@ -781,7 +874,7 @@ def compute_pitcher_scores(pitcher_statcast, luck_filters, era_adj,
             sustainability -= 5
 
     # Chase rate induced — ability to get swings outside zone is sticky
-    chase = recent.get('chase_rate_induced')
+    chase = marcel_sc.get('chase_rate_induced', recent.get('chase_rate_induced'))
     if pd.notna(chase):
         if chase > 32:
             sustainability += 8
@@ -813,7 +906,7 @@ def compute_pitcher_scores(pitcher_statcast, luck_filters, era_adj,
         risk_factors['low_hr_fb_luck'] = min(abs(hr_fb_gap) * 300, 15)
 
     # Low SwStr% — can't miss bats, dependent on defense/sequencing
-    swstr = recent.get('swstr_rate')
+    swstr = marcel_sc.get('swstr_rate', recent.get('swstr_rate'))
     if pd.notna(swstr):
         if swstr < 8.6:
             regression_risk += 12
@@ -822,7 +915,7 @@ def compute_pitcher_scores(pitcher_statcast, luck_filters, era_adj,
             regression_risk += 5
 
     # High fly ball rate — HR-prone profile
-    fb = recent.get('fb_rate')
+    fb = marcel_sc.get('fb_rate', recent.get('fb_rate'))
     if pd.notna(fb):
         if fb > 39:
             regression_risk += 8
@@ -843,35 +936,40 @@ def compute_pitcher_scores(pitcher_statcast, luck_filters, era_adj,
         upside_factors['high_babip_unlucky'] = min(babip_gap * 400, 12)
 
     # Whiff rate trending up — developing miss ability
-    if len(pitcher_statcast) >= 2:
+    # Use pre-computed trends if available, fallback to manual calculation
+    whiff_trend = trends.get('whiff_rate_trend')
+    if whiff_trend is None and len(pitcher_statcast) >= 2:
         sorted_ps = pitcher_statcast.sort_values('season')
-        recent_whiff = sorted_ps.iloc[-1].get('whiff_rate')
-        prev_whiff = sorted_ps.iloc[-2].get('whiff_rate')
+        rw = sorted_ps.iloc[-1].get('whiff_rate')
+        pw = sorted_ps.iloc[-2].get('whiff_rate')
+        if pd.notna(rw) and pd.notna(pw):
+            whiff_trend = rw - pw
+    if whiff_trend is not None and whiff_trend > 2.0:
+        breakout += min(whiff_trend * 3, 12)
+        upside_factors['improving_whiff'] = min(whiff_trend * 3, 12)
 
-        if pd.notna(recent_whiff) and pd.notna(prev_whiff):
-            whiff_trend = recent_whiff - prev_whiff
-            if whiff_trend > 2.0:
-                breakout += min(whiff_trend * 3, 12)
-                upside_factors['improving_whiff'] = min(whiff_trend * 3, 12)
+    # Chase rate improving — getting better at inducing chases
+    chase_trend = trends.get('chase_rate_induced_trend')
+    if chase_trend is None and len(pitcher_statcast) >= 2:
+        sorted_ps = pitcher_statcast.sort_values('season')
+        rc = sorted_ps.iloc[-1].get('chase_rate_induced')
+        pc = sorted_ps.iloc[-2].get('chase_rate_induced')
+        if pd.notna(rc) and pd.notna(pc):
+            chase_trend = rc - pc
+    if chase_trend is not None and chase_trend > 2.0:
+        breakout += min(chase_trend * 2, 8)
 
-        # Chase rate improving — getting better at inducing chases
-        recent_chase = sorted_ps.iloc[-1].get('chase_rate_induced')
-        prev_chase = sorted_ps.iloc[-2].get('chase_rate_induced')
-
-        if pd.notna(recent_chase) and pd.notna(prev_chase):
-            chase_trend = recent_chase - prev_chase
-            if chase_trend > 2.0:
-                breakout += min(chase_trend * 2, 8)
-
-        # Pull air rate against declining — fewer HR coming
-        recent_pull = sorted_ps.iloc[-1].get('pull_air_rate_against')
-        prev_pull = sorted_ps.iloc[-2].get('pull_air_rate_against')
-
-        if pd.notna(recent_pull) and pd.notna(prev_pull):
-            pull_trend = recent_pull - prev_pull
-            if pull_trend < -2.0:
-                breakout += min(abs(pull_trend) * 2, 10)
-                upside_factors['declining_pull_air'] = min(abs(pull_trend) * 2, 10)
+    # Pull air rate against declining — fewer HR coming
+    pull_trend = trends.get('pull_air_rate_against_trend')
+    if pull_trend is None and len(pitcher_statcast) >= 2:
+        sorted_ps = pitcher_statcast.sort_values('season')
+        rp = sorted_ps.iloc[-1].get('pull_air_rate_against')
+        pp = sorted_ps.iloc[-2].get('pull_air_rate_against')
+        if pd.notna(rp) and pd.notna(pp):
+            pull_trend = rp - pp
+    if pull_trend is not None and pull_trend < -2.0:
+        breakout += min(abs(pull_trend) * 2, 10)
+        upside_factors['declining_pull_air'] = min(abs(pull_trend) * 2, 10)
 
     # ── PITCH-LEVEL SIGNALS ─────────────────────────────────
     if pitch_metrics is not None and not pitch_metrics.empty:
@@ -1044,14 +1142,34 @@ def project_pitcher(player_seasons, pitcher_statcast=None, pitch_metrics=None,
     primary_upside = "no_statcast_data"
     key_pitch = "unknown"
     luck = {}
+    marcel_sc = {}
+    trends = {}
 
     if pitcher_statcast is not None and not pitcher_statcast.empty:
-        luck = compute_pitcher_luck_filters(pitcher_statcast)
+        # Marcel-weight ALL pitcher Statcast metrics across 3 years
+        pitcher_sc_metrics = [
+            'avg_exit_velocity_against', 'barrel_rate_against', 'hard_hit_rate_against',
+            'xwoba_against', 'xera', 'whiff_rate', 'swstr_rate',
+            'chase_rate_induced', 'z_contact_rate_against',
+            'pull_air_rate_against', 'gb_rate', 'fb_rate', 'ld_rate',
+            'babip_against', 'hr_per_fb', 'k_minus_bb',
+        ]
+        marcel_sc = marcel_weight_statcast(
+            pitcher_statcast, pitcher_sc_metrics,
+            LEAGUE_AVG_STATCAST_PITCHER,
+            sample_col='statcast_pa', full_season_sample=180,
+        )
+        trends = compute_statcast_trends(pitcher_statcast, pitcher_sc_metrics)
+        luck = compute_pitcher_luck_filters(pitcher_statcast, marcel_sc=marcel_sc)
         sc_era_adj = pitcher_statcast_adjustment(
-            marcel_era, pitcher_statcast, luck, pitch_metrics
+            marcel_era, pitcher_statcast, luck, pitch_metrics,
+            marcel_sc=marcel_sc, trends=trends,
         )
         sustainability, regression_risk, breakout, primary_risk, primary_upside, key_pitch = \
-            compute_pitcher_scores(pitcher_statcast, luck, sc_era_adj, pitch_metrics)
+            compute_pitcher_scores(
+                pitcher_statcast, luck, sc_era_adj, pitch_metrics,
+                marcel_sc=marcel_sc, trends=trends,
+            )
 
     # Apply Statcast adjustment to get final projected ERA
     statcast_adjusted_era = round(proj_era + sc_era_adj, 2)
@@ -1094,6 +1212,11 @@ def project_pitcher(player_seasons, pitcher_statcast=None, pitch_metrics=None,
         'key_pitch': key_pitch,
         'era_aging_adj': round(era_aging, 2),
         'regression_factor': round(regression_factor, 2),
+        # Marcel-weighted Statcast fields (for Floor 1 features if needed)
+        'proj_barrel_rate_against': round(marcel_sc.get('barrel_rate_against', 8.5), 1),
+        'proj_xera': round(marcel_sc.get('xera', 4.20), 2),
+        'proj_whiff_rate': round(marcel_sc.get('whiff_rate', 25.0), 1),
+        'proj_gb_rate': round(marcel_sc.get('gb_rate', 43.0), 1),
     }
 
 
@@ -1179,11 +1302,32 @@ def project_hitter(player_seasons, player_statcast=None, league_avg_woba=None):
     key_indicator = "no_statcast_data"
     luck = {}
 
+    marcel_sc = {}
+    trends = {}
+
     if player_statcast is not None and not player_statcast.empty:
-        luck = compute_luck_filters(player_statcast)
-        sc_adj = statcast_adjustment(marcel_woba, player_statcast, luck)
+        # Marcel-weight ALL Statcast metrics across 3 years
+        hitter_sc_metrics = [
+            'avg_exit_velocity', 'barrel_rate', 'hard_hit_rate',
+            'xwoba', 'xslg', 'xba', 'launch_angle_sweet_spot_pct',
+            'chase_rate', 'whiff_rate', 'z_contact_rate',
+            'pull_air_rate', 'gb_rate', 'fb_rate', 'ld_rate',
+            'babip', 'hr_per_fb',
+        ]
+        marcel_sc = marcel_weight_statcast(
+            player_statcast, hitter_sc_metrics,
+            LEAGUE_AVG_STATCAST_HITTER,
+            sample_col='statcast_pa', full_season_sample=550,
+        )
+        trends = compute_statcast_trends(player_statcast, hitter_sc_metrics)
+        luck = compute_luck_filters(player_statcast, marcel_sc=marcel_sc)
+        sc_adj = statcast_adjustment(
+            marcel_woba, player_statcast, luck,
+            marcel_sc=marcel_sc, trends=trends,
+        )
         bounce_back, regression_risk, key_indicator = compute_scores(
-            player_statcast, luck, sc_adj
+            player_statcast, luck, sc_adj,
+            marcel_sc=marcel_sc, trends=trends,
         )
 
     # Apply Statcast adjustment to get final projected wOBA
@@ -1244,6 +1388,11 @@ def project_hitter(player_seasons, player_statcast=None, league_avg_woba=None):
         'pos_adj_runs': round(pos_adj_runs, 1),
         'woba_aging_adj': round(woba_aging, 3),
         'regression_factor': round(regression_factor, 2),
+        # Marcel-weighted Statcast fields (for Floor 1 features if needed)
+        'proj_barrel_rate': round(marcel_sc.get('barrel_rate', 8.5), 1),
+        'proj_xwoba': round(marcel_sc.get('xwoba', 0.310), 3),
+        'proj_chase_rate': round(marcel_sc.get('chase_rate', 28.0), 1),
+        'proj_whiff_rate': round(marcel_sc.get('whiff_rate', 25.0), 1),
     }
 
 
