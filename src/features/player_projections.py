@@ -478,16 +478,492 @@ def compute_scores(player_statcast, luck_filters, sc_adjustment):
 
 
 # ═══════════════════════════════════════════════════════════════
+# PITCHER STATCAST DATA LOADING + REGRESSION SIGNALS
+# ═══════════════════════════════════════════════════════════════
+
+def load_pitcher_statcast_multi_year():
+    """
+    Load pitcher Statcast metrics for 2023-2025 from pitcher_statcast_metrics table.
+    Returns one row per pitcher per season, keyed on mlb_player_id.
+
+    This gives us the "underlying stuff quality" that traditional ERA hides:
+    - Expected stats (xERA, xwOBA against) strip BABIP/HR luck
+    - Contact suppression (barrel rate, hard hit %) shows true miss quality
+    - Swing & miss (whiff%, K-BB%, chase induced) are the stickiest signals
+    - Batted ball profile (pull_air_rate against) predicts future HR allowed
+    """
+    query = """
+        SELECT
+            p.mlb_id as mlb_player_id,
+            pm.season,
+            pm.avg_exit_velocity_against, pm.barrel_rate_against,
+            pm.hard_hit_rate_against,
+            pm.xwoba_against, pm.xslg_against, pm.xba_against, pm.xera,
+            pm.era, pm.woba_against, pm.babip_against, pm.hr_per_fb,
+            pm.k_rate, pm.bb_rate, pm.k_minus_bb,
+            pm.whiff_rate, pm.swstr_rate,
+            pm.chase_rate_induced, pm.z_contact_rate_against,
+            pm.pull_air_rate_against, pm.gb_rate, pm.fb_rate, pm.ld_rate,
+            pm.pa_against, pm.ip
+        FROM pitcher_statcast_metrics pm
+        JOIN players p ON pm.player_id = p.id
+        WHERE pm.season IN (2023, 2024, 2025)
+    """
+    df = pd.read_sql(query, engine)
+    print(f"  Pitcher Statcast records loaded: {len(df)}")
+    return df
+
+
+def load_pitcher_pitch_metrics():
+    """
+    Load per-pitch-type metrics for 2023-2025 from pitcher_pitch_metrics table.
+    Returns one row per pitcher per season per pitch type.
+
+    Key uses:
+    - Identify the "best pitch" (lowest run_value_per_100)
+    - Detect fastball velocity decline (regression signal)
+    - Find new plus secondary pitches (breakout catalyst)
+    - Measure arsenal diversity (one-pitch pitchers are riskier)
+    """
+    query = """
+        SELECT
+            p.mlb_id as mlb_player_id,
+            pp.season, pp.pitch_type, pp.pitch_name,
+            pp.run_value_per_100, pp.run_value, pp.pitches_thrown,
+            pp.usage_pct, pp.whiff_rate, pp.chase_rate,
+            pp.ba_against, pp.slg_against, pp.woba_against,
+            pp.hard_hit_pct, pp.avg_speed, pp.xwoba_against
+        FROM pitcher_pitch_metrics pp
+        JOIN players p ON pp.player_id = p.id
+        WHERE pp.season IN (2023, 2024, 2025)
+    """
+    df = pd.read_sql(query, engine)
+    print(f"  Pitch-level metrics loaded: {len(df)} (pitch-type-seasons)")
+    return df
+
+
+def compute_pitcher_luck_filters(pitcher_statcast):
+    """
+    Calculate pitcher "luck filters" — gaps between expected and actual.
+    These tell us if a pitcher's ERA was real or driven by BABIP/HR luck.
+
+    Key signals:
+    - era_minus_xera: positive = pitcher was UNLUCKY (ERA > xERA, expect improvement)
+    - babip_vs_career: positive = bad luck on balls in play (expect regression down)
+    - hr_per_fb_vs_norm: above ~12% = HR luck catching up, expect regression
+    - xwoba_vs_woba: if xwOBA_against < actual wOBA_against, pitching better than stats show
+    """
+    if pitcher_statcast.empty:
+        return {}
+
+    career_babip = pitcher_statcast['babip_against'].mean()
+    career_hr_fb = pitcher_statcast['hr_per_fb'].mean()
+    league_hr_fb = 0.12  # League average HR/FB rate
+
+    recent = pitcher_statcast.sort_values('season').iloc[-1]
+    result = {}
+
+    # ERA vs xERA gap — the single best pitcher luck indicator
+    # Positive = unlucky (ERA higher than deserved), negative = overperforming
+    if pd.notna(recent.get('era')) and pd.notna(recent.get('xera')):
+        result['era_minus_xera'] = round(recent['era'] - recent['xera'], 2)
+
+    # BABIP against vs career — above career avg = bad luck, expect improvement
+    if pd.notna(recent.get('babip_against')) and pd.notna(career_babip):
+        result['babip_vs_career'] = round(recent['babip_against'] - career_babip, 3)
+
+    # HR/FB vs league norm — if above 13%, expect regression DOWN (fewer HR)
+    # If below 10%, expect regression UP (more HR coming)
+    if pd.notna(recent.get('hr_per_fb')):
+        result['hr_per_fb_vs_norm'] = round(recent['hr_per_fb'] - league_hr_fb, 3)
+        result['hr_per_fb_vs_career'] = round(recent['hr_per_fb'] - career_hr_fb, 3) if pd.notna(career_hr_fb) else 0
+
+    # xwOBA against vs actual wOBA against
+    if pd.notna(recent.get('xwoba_against')) and pd.notna(recent.get('woba_against')):
+        result['xwoba_vs_woba_against'] = round(
+            recent['xwoba_against'] - recent['woba_against'], 3
+        )
+
+    return result
+
+
+def pitcher_statcast_adjustment(marcel_era, pitcher_statcast, luck_filters,
+                                pitch_metrics=None):
+    """
+    Apply Statcast regression signals to adjust the Marcel ERA projection.
+
+    This mirrors the hitter statcast_adjustment() logic, but for pitchers.
+    Marcel treats every 3.50 ERA pitcher the same. Statcast tells us WHICH 3.50 ERA
+    pitchers actually had elite stuff (sustainable) vs which benefited from
+    lucky BABIP and low HR/FB (unsustainable).
+
+    Adjustment rules (each capped to prevent extreme swings):
+    1. ERA vs xERA + BABIP luck → ERA adjustment (max ±0.40)
+    2. Contact suppression quality (barrel rate, hard hit) → trust/discount (max ±0.20)
+    3. Pull air rate against trend → HR risk signal (max ±0.15)
+    4. Swing & miss sustainability (K-BB%, whiff%, swstr%) → floor/ceiling signal
+    5. Fastball velocity trend → aging/breakout signal (max ±0.15)
+
+    Returns: ERA adjustment value (negative = better than surface, positive = worse)
+    """
+    if pitcher_statcast.empty:
+        return 0.0
+
+    adjustment = 0.0
+    recent = pitcher_statcast.sort_values('season').iloc[-1]
+
+    # --- RULE 1: ERA/xERA + BABIP luck correction ---
+    # If ERA >> xERA AND BABIP above career average, the pitcher was unlucky.
+    # Regress ERA downward (negative adjustment = improvement).
+    era_gap = luck_filters.get('era_minus_xera', 0)
+    babip_gap = luck_filters.get('babip_vs_career', 0)
+
+    if era_gap > 0.30 and babip_gap > 0.010:
+        # ERA inflated by BABIP luck — project improvement
+        # Weight: 40% of the ERA gap, capped at -0.40 (don't over-correct)
+        luck_adj = max(-era_gap * 0.4, -0.40)
+        adjustment += luck_adj
+    elif era_gap < -0.30 and babip_gap < -0.010:
+        # ERA deflated by lucky BABIP — project regression upward
+        luck_adj = min(abs(era_gap) * 0.35, 0.35)
+        adjustment += luck_adj
+
+    # --- RULE 2: Contact suppression quality ---
+    # If barrel rate and hard hit rate are low, the pitching is real.
+    # If they're high despite good ERA, the ERA is borrowed time.
+    if pd.notna(recent.get('barrel_rate_against')):
+        barrel = recent['barrel_rate_against']
+        if barrel < 5.5:
+            # Elite contact suppression — trust the ERA, slight improvement
+            adjustment -= 0.10
+        elif barrel > 9.0:
+            # Hitters barreling this pitcher — ERA will catch up
+            adjustment += 0.15
+
+    if pd.notna(recent.get('hard_hit_rate_against')):
+        hh = recent['hard_hit_rate_against']
+        if hh < 32:
+            adjustment -= 0.05
+        elif hh > 42:
+            adjustment += 0.10
+
+    # --- RULE 3: Pull air rate against trend ---
+    # Pull air rate against is the most underrated pitcher stat.
+    # 66% of HRs come from pulled fly balls. If a pitcher's pull_air_rate_against
+    # is trending up, home run trouble is coming even if HR/FB looks fine now.
+    if len(pitcher_statcast) >= 2:
+        sorted_ps = pitcher_statcast.sort_values('season')
+        recent_pull = sorted_ps.iloc[-1].get('pull_air_rate_against')
+        prev_pull = sorted_ps.iloc[-2].get('pull_air_rate_against')
+
+        if pd.notna(recent_pull) and pd.notna(prev_pull):
+            pull_trend = recent_pull - prev_pull
+            if pull_trend > 2.0:
+                # More pulled fly balls allowed = HR trouble coming
+                adjustment += min(pull_trend * 0.04, 0.15)
+            elif pull_trend < -2.0:
+                # Fewer pulled fly balls = fewer HR coming
+                adjustment -= min(abs(pull_trend) * 0.03, 0.10)
+
+    # --- RULE 4: Swing & miss sustainability ---
+    # K-BB% is the single most predictive pitcher stat year-over-year.
+    # < 10% = heavy BABIP dependence (risky). > 20% = elite, trust the ERA.
+    k_bb = recent.get('k_minus_bb')
+    if pd.notna(k_bb):
+        if k_bb > 20:
+            # Elite swing & miss — ERA has a high floor
+            adjustment -= 0.10
+        elif k_bb < 8:
+            # Very low strikeout-walk differential — BABIP dependent
+            adjustment += 0.15
+
+    # SwStr% as additional check (<8.6% = bottom 5 in the league)
+    swstr = recent.get('swstr_rate')
+    if pd.notna(swstr):
+        if swstr < 8.6:
+            adjustment += 0.08
+        elif swstr > 13.0:
+            adjustment -= 0.05
+
+    # --- RULE 5: Fastball velocity trend ---
+    # Declining FB velocity is the strongest aging signal for pitchers.
+    # If velo drops 1+ mph year-over-year, expect decline. If it ticks up, breakout signal.
+    if pitch_metrics is not None and not pitch_metrics.empty:
+        fb_data = pitch_metrics[pitch_metrics['pitch_type'].isin(['FF', 'SI'])]
+        if len(fb_data) >= 2:
+            fb_sorted = fb_data.sort_values('season')
+            recent_velo = fb_sorted.iloc[-1].get('avg_speed')
+            prev_velo = fb_sorted.iloc[-2].get('avg_speed')
+
+            if pd.notna(recent_velo) and pd.notna(prev_velo):
+                velo_change = recent_velo - prev_velo
+                if velo_change < -1.0:
+                    # Losing velocity — age/injury regression
+                    adjustment += min(abs(velo_change) * 0.10, 0.15)
+                elif velo_change > 0.8:
+                    # Gaining velocity — breakout/health signal
+                    adjustment -= min(velo_change * 0.08, 0.10)
+
+    # Final cap: never adjust more than ±0.60 ERA
+    adjustment = max(-0.60, min(0.60, adjustment))
+    return round(adjustment, 2)
+
+
+def compute_pitcher_scores(pitcher_statcast, luck_filters, era_adj,
+                           pitch_metrics=None):
+    """
+    Compute three pitcher scores (all 0-100) plus flag indicators:
+
+    sustainability_score: How sustainable is the current ERA? (high = safe bet)
+      - Driven by K-BB%, contact suppression, batted ball quality, arsenal diversity
+      - 80+ means the pitcher's stuff backs up the stats
+
+    regression_risk_score: How much ERA inflation risk? (high = sell candidate)
+      - Driven by ERA < xERA, BABIP luck, low SwStr%, HR/FB below norm
+      - 70+ means the surface ERA probably isn't real
+
+    breakout_score: How much upside beyond surface stats? (high = buy candidate)
+      - Driven by xERA < ERA, improving whiff/chase, declining pull_air_rate,
+        new plus pitch emerging
+      - 70+ means this pitcher might be significantly better than ERA shows
+
+    Also identifies:
+    - primary_risk_flag: Single biggest risk factor (e.g., "low_k_bb_pct")
+    - primary_upside_flag: Single biggest upside factor (e.g., "elite_whiff_rate")
+    - key_pitch: The pitcher's best pitch by run value
+    """
+    sustainability = 50
+    regression_risk = 50
+    breakout = 50
+    risk_factors = {}    # name -> weight
+    upside_factors = {}  # name -> weight
+    key_pitch_name = "unknown"
+
+    if pitcher_statcast.empty and not luck_filters:
+        return 50, 50, 50, "insufficient_data", "insufficient_data", "unknown"
+
+    recent = pitcher_statcast.sort_values('season').iloc[-1] if not pitcher_statcast.empty else {}
+
+    # ── SUSTAINABILITY SIGNALS ──────────────────────────────
+    # K-BB% is king — the most stable pitcher metric year-over-year
+    k_bb = recent.get('k_minus_bb')
+    if pd.notna(k_bb):
+        if k_bb > 20:
+            sustainability += 20
+            upside_factors['elite_k_bb_pct'] = 20
+        elif k_bb > 15:
+            sustainability += 10
+        elif k_bb < 10:
+            sustainability -= 10
+            risk_factors['low_k_bb_pct'] = 10
+        elif k_bb < 5:
+            sustainability -= 20
+            risk_factors['very_low_k_bb_pct'] = 20
+
+    # Barrel rate against — elite contact suppression = sustainable
+    barrel = recent.get('barrel_rate_against')
+    if pd.notna(barrel):
+        if barrel < 5.5:
+            sustainability += 12
+            upside_factors['elite_barrel_suppression'] = 12
+        elif barrel < 7.0:
+            sustainability += 5
+        elif barrel > 9.0:
+            sustainability -= 10
+            risk_factors['high_barrel_rate'] = 10
+
+    # Ground ball rate — GB pitchers sustain better (fewer HR)
+    gb = recent.get('gb_rate')
+    if pd.notna(gb):
+        if gb > 50:
+            sustainability += 8
+        elif gb < 38:
+            sustainability -= 5
+
+    # Chase rate induced — ability to get swings outside zone is sticky
+    chase = recent.get('chase_rate_induced')
+    if pd.notna(chase):
+        if chase > 32:
+            sustainability += 8
+            upside_factors['elite_chase_induced'] = 8
+        elif chase < 25:
+            sustainability -= 5
+
+    # ── REGRESSION RISK SIGNALS ─────────────────────────────
+    # ERA outperforming xERA — the #1 regression signal
+    era_gap = luck_filters.get('era_minus_xera', 0)
+    if era_gap < -0.50:
+        # ERA well below xERA — very likely to regress upward
+        regression_risk += min(abs(era_gap) * 15, 25)
+        risk_factors['era_below_xera'] = min(abs(era_gap) * 15, 25)
+    elif era_gap < -0.25:
+        regression_risk += 10
+        risk_factors['era_below_xera'] = 10
+
+    # BABIP against below career (luck-driven ERA suppression)
+    babip_gap = luck_filters.get('babip_vs_career', 0)
+    if babip_gap < -0.020:
+        regression_risk += min(abs(babip_gap) * 400, 15)
+        risk_factors['low_babip_luck'] = min(abs(babip_gap) * 400, 15)
+
+    # HR/FB below league norm — HR luck will catch up
+    hr_fb_gap = luck_filters.get('hr_per_fb_vs_norm', 0)
+    if hr_fb_gap < -0.03:
+        regression_risk += min(abs(hr_fb_gap) * 300, 15)
+        risk_factors['low_hr_fb_luck'] = min(abs(hr_fb_gap) * 300, 15)
+
+    # Low SwStr% — can't miss bats, dependent on defense/sequencing
+    swstr = recent.get('swstr_rate')
+    if pd.notna(swstr):
+        if swstr < 8.6:
+            regression_risk += 12
+            risk_factors['low_swstr'] = 12
+        elif swstr < 10.0:
+            regression_risk += 5
+
+    # High fly ball rate — HR-prone profile
+    fb = recent.get('fb_rate')
+    if pd.notna(fb):
+        if fb > 39:
+            regression_risk += 8
+            risk_factors['high_fb_rate'] = 8
+
+    # ── BREAKOUT SIGNALS ────────────────────────────────────
+    # xERA better than ERA — stuff is better than results show
+    if era_gap > 0.50:
+        breakout += min(era_gap * 15, 25)
+        upside_factors['xera_better_than_era'] = min(era_gap * 15, 25)
+    elif era_gap > 0.25:
+        breakout += 10
+        upside_factors['xera_better_than_era'] = 10
+
+    # BABIP against above career — unlucky, expect improvement
+    if babip_gap > 0.020:
+        breakout += min(babip_gap * 400, 12)
+        upside_factors['high_babip_unlucky'] = min(babip_gap * 400, 12)
+
+    # Whiff rate trending up — developing miss ability
+    if len(pitcher_statcast) >= 2:
+        sorted_ps = pitcher_statcast.sort_values('season')
+        recent_whiff = sorted_ps.iloc[-1].get('whiff_rate')
+        prev_whiff = sorted_ps.iloc[-2].get('whiff_rate')
+
+        if pd.notna(recent_whiff) and pd.notna(prev_whiff):
+            whiff_trend = recent_whiff - prev_whiff
+            if whiff_trend > 2.0:
+                breakout += min(whiff_trend * 3, 12)
+                upside_factors['improving_whiff'] = min(whiff_trend * 3, 12)
+
+        # Chase rate improving — getting better at inducing chases
+        recent_chase = sorted_ps.iloc[-1].get('chase_rate_induced')
+        prev_chase = sorted_ps.iloc[-2].get('chase_rate_induced')
+
+        if pd.notna(recent_chase) and pd.notna(prev_chase):
+            chase_trend = recent_chase - prev_chase
+            if chase_trend > 2.0:
+                breakout += min(chase_trend * 2, 8)
+
+        # Pull air rate against declining — fewer HR coming
+        recent_pull = sorted_ps.iloc[-1].get('pull_air_rate_against')
+        prev_pull = sorted_ps.iloc[-2].get('pull_air_rate_against')
+
+        if pd.notna(recent_pull) and pd.notna(prev_pull):
+            pull_trend = recent_pull - prev_pull
+            if pull_trend < -2.0:
+                breakout += min(abs(pull_trend) * 2, 10)
+                upside_factors['declining_pull_air'] = min(abs(pull_trend) * 2, 10)
+
+    # ── PITCH-LEVEL SIGNALS ─────────────────────────────────
+    if pitch_metrics is not None and not pitch_metrics.empty:
+        recent_pitches = pitch_metrics[
+            pitch_metrics['season'] == pitch_metrics['season'].max()
+        ]
+
+        if not recent_pitches.empty:
+            # Find best pitch by run value per 100
+            best = recent_pitches.loc[recent_pitches['run_value_per_100'].idxmin()]
+            key_pitch_name = best.get('pitch_name', best.get('pitch_type', 'unknown'))
+
+            # A truly plus pitch (run_value_per_100 < -1.0) boosts sustainability
+            if best['run_value_per_100'] < -1.5:
+                sustainability += 8
+                upside_factors['plus_pitch'] = 8
+            elif best['run_value_per_100'] < -1.0:
+                sustainability += 4
+
+            # Arsenal diversity — count pitches with >10% usage
+            meaningful_pitches = recent_pitches[recent_pitches['usage_pct'] > 10]
+            n_pitches = len(meaningful_pitches)
+            if n_pitches >= 4:
+                sustainability += 5  # Deep arsenal is harder to game-plan
+            elif n_pitches <= 2:
+                regression_risk += 8
+                risk_factors['limited_arsenal'] = 8
+
+            # New plus secondary — pitch not thrown much last year but elite whiff
+            if len(pitch_metrics) > len(recent_pitches):
+                prev_pitches = pitch_metrics[
+                    pitch_metrics['season'] == pitch_metrics['season'].max() - 1
+                ]
+                for _, p in recent_pitches.iterrows():
+                    prev_match = prev_pitches[prev_pitches['pitch_type'] == p['pitch_type']]
+                    if (prev_match.empty or prev_match.iloc[0]['usage_pct'] < 5) and \
+                       pd.notna(p.get('whiff_rate')) and p['whiff_rate'] > 30 and \
+                       p['usage_pct'] > 10:
+                        breakout += 10
+                        upside_factors['new_plus_pitch'] = 10
+                        break
+
+            # Fastball velocity decline (regression signal for aging pitchers)
+            fb_data = pitch_metrics[pitch_metrics['pitch_type'].isin(['FF', 'SI'])]
+            if len(fb_data) >= 2:
+                fb_sorted = fb_data.sort_values('season')
+                recent_velo = fb_sorted.iloc[-1].get('avg_speed')
+                prev_velo = fb_sorted.iloc[-2].get('avg_speed')
+                if pd.notna(recent_velo) and pd.notna(prev_velo):
+                    velo_change = recent_velo - prev_velo
+                    if velo_change < -1.0:
+                        regression_risk += 10
+                        risk_factors['declining_velocity'] = 10
+                    elif velo_change > 0.8:
+                        breakout += 5
+                        upside_factors['velocity_gain'] = 5
+
+    # Incorporate the ERA adjustment direction
+    if era_adj < -0.20:
+        breakout += 8
+    elif era_adj > 0.20:
+        regression_risk += 8
+
+    # Clamp all scores to 0-100
+    sustainability = max(0, min(100, round(sustainability)))
+    regression_risk = max(0, min(100, round(regression_risk)))
+    breakout = max(0, min(100, round(breakout)))
+
+    # Identify primary flags
+    primary_risk = max(risk_factors, key=risk_factors.get) if risk_factors else "none"
+    primary_upside = max(upside_factors, key=upside_factors.get) if upside_factors else "none"
+
+    return sustainability, regression_risk, breakout, primary_risk, primary_upside, key_pitch_name
+
+
+# ═══════════════════════════════════════════════════════════════
 # MARCEL PROJECTION ENGINE
 # ═══════════════════════════════════════════════════════════════
 
-def project_pitcher(player_seasons, league_avg_era=4.20, league_avg_fip=4.20):
+def project_pitcher(player_seasons, pitcher_statcast=None, pitch_metrics=None,
+                    league_avg_era=4.20, league_avg_fip=4.20):
     """
-    Marcel-style projection for a single pitcher.
+    Marcel-style projection for a single pitcher, now with Statcast overlay.
 
-    Weighting: 2025 × 5, 2024 × 4, 2023 × 3
-    Then regress toward league average.
-    Then apply aging curve.
+    Step 1: Compute the base Marcel ERA/FIP (3-year weighted average + regression + aging)
+    Step 2: If Statcast data exists, compute luck filters and apply ERA adjustment
+    Step 3: Generate sustainability, regression risk, and breakout scores
+    Step 4: Identify key pitch and risk/upside flags
+
+    The Statcast layer doesn't replace Marcel — it CORRECTS it. A pitcher with 3.20 ERA
+    but high BABIP luck and low K-BB% gets projected worse than a 3.20 ERA pitcher
+    with elite barrel suppression and 20% K-BB%.
     """
     if player_seasons.empty:
         return None
@@ -554,6 +1030,35 @@ def project_pitcher(player_seasons, league_avg_era=4.20, league_avg_fip=4.20):
     proj_era += era_aging
     proj_fip += era_aging * 0.7  # FIP ages slightly less than ERA
 
+    # This is the pure Marcel ERA BEFORE Statcast
+    marcel_era = round(proj_era, 2)
+
+    # ── PITCHER STATCAST OVERLAY ──────────────────────────────
+    # Layer Statcast on top of Marcel as regression signals.
+    # If no Statcast data, these default to neutral values.
+    sc_era_adj = 0.0
+    sustainability = 50
+    regression_risk = 50
+    breakout = 50
+    primary_risk = "no_statcast_data"
+    primary_upside = "no_statcast_data"
+    key_pitch = "unknown"
+    luck = {}
+
+    if pitcher_statcast is not None and not pitcher_statcast.empty:
+        luck = compute_pitcher_luck_filters(pitcher_statcast)
+        sc_era_adj = pitcher_statcast_adjustment(
+            marcel_era, pitcher_statcast, luck, pitch_metrics
+        )
+        sustainability, regression_risk, breakout, primary_risk, primary_upside, key_pitch = \
+            compute_pitcher_scores(pitcher_statcast, luck, sc_era_adj, pitch_metrics)
+
+    # Apply Statcast adjustment to get final projected ERA
+    statcast_adjusted_era = round(proj_era + sc_era_adj, 2)
+
+    # Also adjust FIP proportionally (same direction, slightly less magnitude)
+    proj_fip += sc_era_adj * 0.6
+
     # Projected IP
     recent_ip = player_seasons[player_seasons['season'] == 2025]['ip'].sum()
     if recent_ip == 0:
@@ -571,13 +1076,22 @@ def project_pitcher(player_seasons, league_avg_era=4.20, league_avg_fip=4.20):
         'role': role,
         'years_of_data': years_available,
         'total_ip_history': round(total_ip, 1),
-        'proj_era': round(proj_era, 2),
+        'marcel_era': marcel_era,
+        'statcast_adjusted_era': statcast_adjusted_era,
+        'statcast_era_adj': round(sc_era_adj, 2),
+        'proj_era': round(statcast_adjusted_era, 2),
         'proj_fip': round(proj_fip, 2),
         'proj_k_pct': round(proj_k_pct, 1),
         'proj_bb_pct': round(proj_bb_pct, 1),
         'proj_k_bb_pct': round(proj_k_pct - proj_bb_pct, 1),
         'proj_ip': round(proj_ip, 0),
         'proj_war': round(proj_war, 1),
+        'sustainability_score': sustainability,
+        'regression_risk_score': regression_risk,
+        'breakout_score': breakout,
+        'primary_risk_flag': primary_risk,
+        'primary_upside_flag': primary_upside,
+        'key_pitch': key_pitch,
         'era_aging_adj': round(era_aging, 2),
         'regression_factor': round(regression_factor, 2),
     }
@@ -755,9 +1269,13 @@ def run_projections(team_filter=None, player_filter=None):
     print(f"  Pitcher-seasons: {len(pitchers_raw)}")
     print(f"  Hitter-seasons:  {len(hitters_raw)}")
 
-    # Load Statcast data (new in Phase 2)
+    # Load Statcast data — hitters
     print("\nLoading Statcast metrics...")
     statcast_raw = load_statcast_multi_year()
+
+    # Load Statcast data — pitchers
+    pitcher_sc_raw = load_pitcher_statcast_multi_year()
+    pitch_metrics_raw = load_pitcher_pitch_metrics()
 
     # Get current rosters
     print("\nFetching current 2026 rosters...")
@@ -774,17 +1292,25 @@ def run_projections(team_filter=None, player_filter=None):
 
     print(f"  Players on 2026 rosters: {len(roster_map)}")
 
-    # Project pitchers (unchanged — Statcast hitter-only for now)
-    print("\nProjecting pitchers...")
+    # Project pitchers WITH Statcast overlay
+    print("\nProjecting pitchers (with Statcast adjustment)...")
     pitcher_projections = []
+    pitcher_sc_hits = 0
+
     for pid, group in pitchers_raw.groupby('mlb_player_id'):
-        proj = project_pitcher(group)
+        # Get this pitcher's Statcast data across all seasons
+        p_sc = pitcher_sc_raw[pitcher_sc_raw['mlb_player_id'] == pid]
+        p_pm = pitch_metrics_raw[pitch_metrics_raw['mlb_player_id'] == pid]
+
+        proj = project_pitcher(group, pitcher_statcast=p_sc, pitch_metrics=p_pm)
         if proj:
             proj['current_team'] = roster_map.get(pid, 'Free Agent')
             pitcher_projections.append(proj)
+            if not p_sc.empty:
+                pitcher_sc_hits += 1
 
     p_df = pd.DataFrame(pitcher_projections)
-    print(f"  Projected {len(p_df)} pitchers")
+    print(f"  Projected {len(p_df)} pitchers ({pitcher_sc_hits} with Statcast data)")
 
     # Project hitters WITH Statcast overlay
     print("Projecting hitters (with Statcast adjustment)...")
@@ -818,9 +1344,20 @@ def run_projections(team_filter=None, player_filter=None):
                 print(f"\n  {r['player_name']} (Age {r['age_2026']}, {r['role']})")
                 print(f"  Current team: {r['current_team']}")
                 print(f"  Data: {r['years_of_data']} years, {r['total_ip_history']} career IP")
-                print(f"  Projected: {r['proj_era']:.2f} ERA | {r['proj_fip']:.2f} FIP | "
+                # Marcel vs Statcast-adjusted ERA
+                print(f"  Marcel ERA:     {r['marcel_era']:.2f}")
+                print(f"  Statcast ERA:   {r['statcast_adjusted_era']:.2f} "
+                      f"({r['statcast_era_adj']:+.2f} adjustment)")
+                print(f"  Projected: {r['proj_fip']:.2f} FIP | "
                       f"{r['proj_k_bb_pct']:.1f} K-BB%")
                 print(f"  Projected: {r['proj_ip']:.0f} IP | {r['proj_war']:.1f} WAR")
+                # Statcast scores
+                print(f"  Sustainability:    {r['sustainability_score']}/100")
+                print(f"  Regression risk:   {r['regression_risk_score']}/100")
+                print(f"  Breakout score:    {r['breakout_score']}/100")
+                print(f"  Risk flag:  {r['primary_risk_flag']}")
+                print(f"  Upside flag: {r['primary_upside_flag']}")
+                print(f"  Key pitch:  {r['key_pitch']}")
                 print(f"  Aging adj: {r['era_aging_adj']:+.2f} ERA | "
                       f"Regression: {r['regression_factor']:.0%} confidence")
 
@@ -896,7 +1433,8 @@ def run_projections(team_filter=None, player_filter=None):
 
         if not sp.empty:
             sp_str = " | ".join(
-                f"{r['player_name']} ({r['proj_era']:.2f} ERA, {r['proj_war']:.1f}W, age {r['age_2026']})"
+                f"{r['player_name']} ({r['statcast_adjusted_era']:.2f} ERA, "
+                f"{r['proj_war']:.1f}W, sust:{r['sustainability_score']})"
                 for _, r in sp.iterrows()
             )
             print(f"    Rotation: {sp_str}")
