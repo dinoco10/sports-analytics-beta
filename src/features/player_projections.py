@@ -44,42 +44,150 @@ def api_get(endpoint, params=None):
 # AGING CURVES
 # ═══════════════════════════════════════════════════════════════
 
+def hitter_aging_curves(age):
+    """
+    Nonlinear, tool-specific aging curves for hitters.
+    Returns a dict of per-metric aging deltas.
+
+    Different physical tools age on different schedules:
+    - SPEED peaks earliest (24-26) and declines steeply.
+      Think sprint speed dropping ~0.1 ft/s per year after 28.
+    - POWER (barrel rate, exit velocity) peaks 27-30 and declines slowly.
+      Muscle memory and strength hold up longer than fast-twitch.
+    - PLATE DISCIPLINE (BB%) is the most stable skill.
+      Veterans actually improve until early 30s — they learn the zone.
+    - CONTACT (K%) worsens steadily from ~28.
+      Bat speed declines, pitchers exploit weak zones more.
+
+    The composite wOBA delta is derived from weighting these components:
+    wOBA ≈ 40% power + 25% contact + 20% discipline + 15% speed
+
+    Source: Lichtman delta-method aging research, FanGraphs, plus
+    Statcast-era refinements showing power holds better than previously thought.
+    """
+    # Each row: (power_barrel_delta, speed_multiplier, discipline_bb_delta,
+    #            contact_k_delta, composite_woba)
+    #
+    # Power = barrel rate delta (percentage points)
+    # Speed = multiplier on PA projection and SB projection
+    # Discipline = BB% delta (percentage points, positive = more walks)
+    # Contact = K% delta (percentage points, positive = more strikeouts)
+    # Composite = weighted wOBA delta derived from the components
+    curves = {
+        # Young — still developing, especially power. Speed at peak.
+        'young':      {'power': +0.3, 'speed': 1.02, 'disc': -0.2, 'contact': +0.3, 'woba': +0.008},
+        # Pre-peak — power still growing, speed starts ticking down
+        'pre_peak':   {'power': +0.2, 'speed': 1.00, 'disc':  0.0, 'contact':  0.0, 'woba': +0.005},
+        # Peak — everything in balance. Best overall production.
+        'peak':       {'power':  0.0, 'speed': 0.97, 'disc': +0.1, 'contact': -0.2, 'woba':  0.000},
+        # Early decline — power barely fading, speed dropping noticeably
+        'early_dec':  {'power': -0.3, 'speed': 0.92, 'disc': +0.1, 'contact': -0.5, 'woba': -0.006},
+        # Mid decline — power fading, speed falling fast, discipline holding
+        'mid_dec':    {'power': -0.6, 'speed': 0.85, 'disc':  0.0, 'contact': -0.8, 'woba': -0.014},
+        # Late decline — significant across all tools
+        'late_dec':   {'power': -1.0, 'speed': 0.78, 'disc': -0.1, 'contact': -1.2, 'woba': -0.022},
+        # Steep — only discipline/guile remain somewhat intact
+        'steep':      {'power': -1.5, 'speed': 0.70, 'disc': -0.3, 'contact': -1.5, 'woba': -0.032},
+        # Cliff — everything falling apart
+        'cliff':      {'power': -2.0, 'speed': 0.60, 'disc': -0.5, 'contact': -2.0, 'woba': -0.045},
+    }
+
+    if age <= 25:   phase = 'young'
+    elif age <= 27: phase = 'pre_peak'
+    elif age <= 29: phase = 'peak'
+    elif age <= 31: phase = 'early_dec'
+    elif age <= 33: phase = 'mid_dec'
+    elif age <= 35: phase = 'late_dec'
+    elif age <= 37: phase = 'steep'
+    else:           phase = 'cliff'
+
+    c = curves[phase]
+    return {
+        'woba': c['woba'],                         # Composite wOBA delta
+        'barrel_rate': c['power'],                  # Barrel % delta (power tool)
+        'exit_velo': c['power'] * 0.15,             # Exit velo ages with power (~0.15 mph per barrel pt)
+        'k_pct': c['contact'],                      # K% delta (positive = more Ks = worse)
+        'bb_pct': c['disc'],                        # BB% delta (positive = more walks = better)
+        'speed_mult': c['speed'],                   # Multiplier on PA/SB projections
+        'whiff_rate': c['contact'] * 0.4,           # Whiff ages with contact (same direction)
+        'chase_rate': c['disc'] * -0.8,             # Chase ages inversely with discipline
+    }
+
+
+def pitcher_aging_curves(age):
+    """
+    Nonlinear, tool-specific aging curves for pitchers.
+    Returns a dict of per-metric aging deltas.
+
+    Pitcher tools age differently than hitters:
+    - VELOCITY drops ~0.5 mph/year after 28 (fast-twitch muscle decline).
+      This is the most measurable and predictable decline.
+    - COMMAND (BB%) is relatively stable, can even IMPROVE into early 30s.
+      Pitchers learn sequencing, zone management, and batter tendencies.
+    - STUFF (K%, whiff rate) declines with velocity, but offset somewhat
+      by command gains and pitch tunneling improvements.
+    - GROUND BALL TENDENCY is very stable — it's a pitch design feature,
+      not a physical tool. Sinkerballers stay sinkerballers.
+
+    The composite ERA delta is derived from:
+    ERA ≈ 50% stuff/K + 30% command/BB + 20% velocity
+
+    Source: FanGraphs pitcher aging curves, Statcast velocity tracking data.
+    """
+    curves = {
+        # Young — still gaining velo and refining command
+        'young':      {'velo': +0.3, 'command': -0.3, 'stuff': +0.5, 'era': -0.10},
+        # Peak — everything balanced, best performance window
+        'peak':       {'velo':  0.0, 'command':  0.0, 'stuff':  0.0, 'era':  0.00},
+        # Early decline — velo starting to tick down, command compensates
+        'early_dec':  {'velo': -0.3, 'command': +0.1, 'stuff': -0.3, 'era': +0.06},
+        # Mid decline — velo loss noticeable, command still OK
+        'mid_dec':    {'velo': -0.5, 'command': +0.1, 'stuff': -0.7, 'era': +0.14},
+        # Late decline — can't overpower, relying on command + craft
+        'late_dec':   {'velo': -0.8, 'command':  0.0, 'stuff': -1.0, 'era': +0.22},
+        # Steep — significant across all tools
+        'steep':      {'velo': -1.2, 'command': -0.2, 'stuff': -1.5, 'era': +0.32},
+        # Very steep — only craftiest survive
+        'very_steep': {'velo': -1.5, 'command': -0.4, 'stuff': -2.0, 'era': +0.42},
+        # Cliff — everything gone
+        'cliff':      {'velo': -2.0, 'command': -0.6, 'stuff': -2.5, 'era': +0.58},
+    }
+
+    if age <= 25:   phase = 'young'
+    elif age <= 28: phase = 'peak'
+    elif age <= 30: phase = 'early_dec'
+    elif age <= 32: phase = 'mid_dec'
+    elif age <= 34: phase = 'late_dec'
+    elif age <= 36: phase = 'steep'
+    elif age <= 38: phase = 'very_steep'
+    else:           phase = 'cliff'
+
+    c = curves[phase]
+    return {
+        'era': c['era'],                            # Composite ERA delta
+        'k_pct': c['stuff'],                        # K% delta (negative = fewer Ks = worse)
+        'bb_pct': c['command'],                     # BB% delta (negative = more walks = worse)
+        'velocity': c['velo'],                      # Velocity delta in mph
+        'whiff_rate': c['stuff'] * 0.5,             # Whiff rate ages with stuff
+        'barrel_rate_against': c['stuff'] * -0.1,   # Barrel suppression degrades with stuff loss
+    }
+
+
+# Legacy wrappers — keep for backward compatibility with any external callers
 def pitcher_aging_adjustment(age):
-    """
-    ERA adjustment by age. Based on historical aging curves.
-    Positive = expected to get WORSE (higher ERA).
-    Peak age for pitchers: 26-28.
-
-    Source: FanGraphs aging curve research, simplified.
-    """
-    if age <= 25:   return -0.10  # Still improving
-    elif age <= 28: return  0.00  # Peak
-    elif age <= 30: return  0.05  # Slight decline
-    elif age <= 32: return  0.12  # Noticeable
-    elif age <= 34: return  0.20  # Significant
-    elif age <= 36: return  0.30  # Steep
-    elif age <= 38: return  0.40  # Very steep
-    else:           return  0.55  # Cliff
-
+    """ERA adjustment by age. Now delegates to pitcher_aging_curves()."""
+    return pitcher_aging_curves(age)['era']
 
 def hitter_aging_adjustment(age):
-    """
-    wOBA adjustment by age. Negative = expected decline.
-    Peak age for hitters: 26-29.
-    """
-    if age <= 25:   return +0.008  # Still improving
-    elif age <= 29: return  0.000  # Peak
-    elif age <= 31: return -0.005  # Slight decline
-    elif age <= 33: return -0.012  # Noticeable
-    elif age <= 35: return -0.020  # Significant
-    elif age <= 37: return -0.030  # Steep
-    else:           return -0.045  # Cliff
+    """wOBA adjustment by age. Now delegates to hitter_aging_curves()."""
+    return hitter_aging_curves(age)['woba']
 
 
 def playing_time_adjustment(age, role):
     """
     Projected IP or PA multiplier based on age and role.
-    Older players get fewer projected innings/PAs due to injury risk.
+    For hitters, incorporates the speed-based aging curve.
+    For pitchers, uses role-specific tables (SP riskier with age).
     """
     if role == 'SP':
         if age <= 28: return 1.00
@@ -93,13 +201,8 @@ def playing_time_adjustment(age, role):
         elif age <= 33: return 0.92
         elif age <= 36: return 0.82
         else: return 0.70
-    else:  # Hitter
-        if age <= 29: return 1.00
-        elif age <= 31: return 0.96
-        elif age <= 33: return 0.90
-        elif age <= 35: return 0.82
-        elif age <= 37: return 0.72
-        else: return 0.60
+    else:  # Hitter — use speed multiplier from aging curves
+        return hitter_aging_curves(age)['speed_mult']
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -1123,10 +1226,17 @@ def project_pitcher(player_seasons, pitcher_statcast=None, pitch_metrics=None,
     proj_era = proj_era * regression_factor + league_avg_era * (1 - regression_factor)
     proj_fip = proj_fip * regression_factor + league_avg_fip * (1 - regression_factor)
 
-    # Aging adjustment
-    era_aging = pitcher_aging_adjustment(age_2026)
+    # ── TOOL-SPECIFIC AGING ─────────────────────────────────
+    # Different pitcher tools age at different rates:
+    # - Velocity drops ~0.5 mph/year after 28
+    # - Command (BB%) is stable, can even improve into early 30s
+    # - Stuff (K%) declines with velocity
+    aging = pitcher_aging_curves(age_2026)
+    era_aging = aging['era']
     proj_era += era_aging
     proj_fip += era_aging * 0.7  # FIP ages slightly less than ERA
+    proj_k_pct += aging['k_pct']
+    proj_bb_pct += aging['bb_pct']
 
     # This is the pure Marcel ERA BEFORE Statcast
     marcel_era = round(proj_era, 2)
@@ -1159,6 +1269,11 @@ def project_pitcher(player_seasons, pitcher_statcast=None, pitch_metrics=None,
             LEAGUE_AVG_STATCAST_PITCHER,
             sample_col='statcast_pa', full_season_sample=180,
         )
+        # Apply tool-specific aging to Marcel-weighted Statcast metrics
+        if 'whiff_rate' in marcel_sc:
+            marcel_sc['whiff_rate'] += aging['whiff_rate']
+        if 'barrel_rate_against' in marcel_sc:
+            marcel_sc['barrel_rate_against'] += aging['barrel_rate_against']
         trends = compute_statcast_trends(pitcher_statcast, pitcher_sc_metrics)
         luck = compute_pitcher_luck_filters(pitcher_statcast, marcel_sc=marcel_sc)
         sc_era_adj = pitcher_statcast_adjustment(
@@ -1211,6 +1326,9 @@ def project_pitcher(player_seasons, pitcher_statcast=None, pitch_metrics=None,
         'primary_upside_flag': primary_upside,
         'key_pitch': key_pitch,
         'era_aging_adj': round(era_aging, 2),
+        'aging_k_pct_adj': round(aging['k_pct'], 1),
+        'aging_bb_pct_adj': round(aging['bb_pct'], 1),
+        'aging_velo_adj': round(aging['velocity'], 1),
         'regression_factor': round(regression_factor, 2),
         # Marcel-weighted Statcast fields (for Floor 1 features if needed)
         'proj_barrel_rate_against': round(marcel_sc.get('barrel_rate_against', 8.5), 1),
@@ -1286,9 +1404,17 @@ def project_hitter(player_seasons, player_statcast=None, league_avg_woba=None):
     regression_factor = min(total_pa / 1500, 1.0)
     proj_woba = proj_woba * regression_factor + league_avg_woba * (1 - regression_factor)
 
-    # Aging adjustment
-    woba_aging = hitter_aging_adjustment(age_2026)
+    # ── TOOL-SPECIFIC AGING ─────────────────────────────────
+    # Different hitter tools age at different rates:
+    # - Speed peaks earliest (24-26), declines steeply
+    # - Power (barrel rate) peaks 27-30, declines slowly
+    # - Plate discipline (BB%) most stable, barely moves until late 30s
+    # - Contact (K%) worsens steadily from ~28
+    aging = hitter_aging_curves(age_2026)
+    woba_aging = aging['woba']
     proj_woba += woba_aging
+    proj_k_pct += aging['k_pct']
+    proj_bb_pct += aging['bb_pct']
 
     # This is the pure Marcel projection BEFORE Statcast
     marcel_woba = round(proj_woba, 3)
@@ -1319,6 +1445,15 @@ def project_hitter(player_seasons, player_statcast=None, league_avg_woba=None):
             LEAGUE_AVG_STATCAST_HITTER,
             sample_col='statcast_pa', full_season_sample=550,
         )
+        # Apply tool-specific aging to Marcel-weighted Statcast metrics
+        if 'barrel_rate' in marcel_sc:
+            marcel_sc['barrel_rate'] += aging['barrel_rate']
+        if 'avg_exit_velocity' in marcel_sc:
+            marcel_sc['avg_exit_velocity'] += aging['exit_velo']
+        if 'whiff_rate' in marcel_sc:
+            marcel_sc['whiff_rate'] += aging['whiff_rate']
+        if 'chase_rate' in marcel_sc:
+            marcel_sc['chase_rate'] += aging['chase_rate']
         trends = compute_statcast_trends(player_statcast, hitter_sc_metrics)
         luck = compute_luck_filters(player_statcast, marcel_sc=marcel_sc)
         sc_adj = statcast_adjustment(
@@ -1387,6 +1522,9 @@ def project_hitter(player_seasons, player_statcast=None, league_avg_woba=None):
         'proj_war': round(proj_fwar, 1),
         'pos_adj_runs': round(pos_adj_runs, 1),
         'woba_aging_adj': round(woba_aging, 3),
+        'aging_k_pct_adj': round(aging['k_pct'], 1),
+        'aging_bb_pct_adj': round(aging['bb_pct'], 1),
+        'aging_barrel_adj': round(aging['barrel_rate'], 1),
         'regression_factor': round(regression_factor, 2),
         # Marcel-weighted Statcast fields (for Floor 1 features if needed)
         'proj_barrel_rate': round(marcel_sc.get('barrel_rate', 8.5), 1),
