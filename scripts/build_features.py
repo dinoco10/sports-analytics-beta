@@ -624,6 +624,10 @@ def load_projection_maps():
                 'proj_war': row.get('proj_war', 0),
                 'proj_fip': row.get('proj_fip', 4.20),
                 'proj_era': row.get('proj_era', 4.20),
+                'statcast_adjusted_era': row.get('statcast_adjusted_era', row.get('proj_era', 4.20)),
+                'sustainability_score': row.get('sustainability_score', 50),
+                'breakout_score': row.get('breakout_score', 50),
+                'proj_k_bb_pct': row.get('proj_k_bb_pct', 10.0),
             }
         print(f"    Loaded {len(pitcher_map)} pitcher projections")
     else:
@@ -680,7 +684,9 @@ def compute_projection_features(games_df, hitting_df, pitcher_map, hitter_map):
     conn.close()
     pid_map = dict(zip(pid_to_mlb['id'], pid_to_mlb['mlb_id']))
 
-    default_sp = {'proj_war': 0, 'proj_fip': 4.50, 'proj_era': 4.50}
+    default_sp = {'proj_war': 0, 'proj_fip': 4.50, 'proj_era': 4.50,
+                  'statcast_adjusted_era': 4.50, 'sustainability_score': 50,
+                  'breakout_score': 50, 'proj_k_bb_pct': 10.0}
     default_hitter = {'sc_woba': 0.310, 'wrc_plus': 100, 'bounce_back': 50, 'proj_war': 0}
 
     for _, game in games_df.iterrows():
@@ -700,6 +706,10 @@ def compute_projection_features(games_df, hitting_df, pitcher_map, hitter_map):
 
             row[f'{side}_proj_sp_war'] = sp_proj['proj_war']
             row[f'{side}_proj_sp_fip'] = sp_proj['proj_fip']
+            row[f'{side}_proj_sp_sc_era'] = sp_proj['statcast_adjusted_era']
+            row[f'{side}_proj_sp_sust'] = sp_proj['sustainability_score']
+            row[f'{side}_proj_sp_breakout'] = sp_proj['breakout_score']
+            row[f'{side}_proj_sp_k_bb'] = sp_proj['proj_k_bb_pct']
 
             # --- Lineup projection ---
             # Average statcast_adjusted_woba and bounce-back of hitters in this game
@@ -720,6 +730,9 @@ def compute_projection_features(games_df, hitting_df, pitcher_map, hitter_map):
         # Differentials
         row['diff_proj_sp_war'] = row['home_proj_sp_war'] - row['away_proj_sp_war']
         row['diff_proj_sp_fip'] = row['away_proj_sp_fip'] - row['home_proj_sp_fip']  # Lower FIP = better
+        row['diff_proj_sp_sc_era'] = row['away_proj_sp_sc_era'] - row['home_proj_sp_sc_era']  # Lower ERA = better
+        row['diff_proj_sp_sust'] = row['home_proj_sp_sust'] - row['away_proj_sp_sust']
+        row['diff_proj_sp_k_bb'] = row['home_proj_sp_k_bb'] - row['away_proj_sp_k_bb']
         row['diff_proj_lineup_woba'] = row['home_proj_lineup_woba'] - row['away_proj_lineup_woba']
 
         results.append(row)

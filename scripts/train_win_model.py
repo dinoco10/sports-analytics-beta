@@ -89,8 +89,9 @@ def get_feature_layers():
         },
         5: {
             "name": "+ Projections",
-            "description": "Marcel+Statcast SP WAR/FIP and lineup projected wOBA",
-            "patterns": ["proj_sp_war", "proj_sp_fip",
+            "description": "Marcel+Statcast SP WAR/FIP/ERA/sustainability/K-BB and lineup projected wOBA",
+            "patterns": ["proj_sp_war", "proj_sp_fip", "proj_sp_sc_era",
+                         "proj_sp_sust", "proj_sp_breakout", "proj_sp_k_bb",
                          "proj_lineup_woba", "proj_lineup_bb_score"],
         },
     }
