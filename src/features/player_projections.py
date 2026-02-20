@@ -23,6 +23,10 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspa
 
 from sqlalchemy import text
 from src.storage.database import engine
+from config.settings import (
+    POSITION_ADJUSTMENT_RUNS, LEAGUE_AVG_WOBA, LEAGUE_AVG_WOBA_SCALE,
+    LEAGUE_AVG_R_PA, RUNS_PER_WIN, REPLACEMENT_LEVEL_WINS,
+)
 import requests, time
 
 MLB = "https://statsapi.mlb.com/api/v1"
@@ -141,12 +145,13 @@ def load_pitcher_multi_year():
 
 
 def load_hitter_multi_year():
-    """Load hitter stats for 2023-2025 from database."""
+    """Load hitter stats for 2023-2025 from database, including position."""
     query = """
         SELECT
             p.mlb_id as mlb_player_id,
             p.name as player_name,
             p.birth_date,
+            p.primary_position,
             strftime('%Y', hs.date) as season,
             t.name as team_name,
             SUM(hs.plate_appearances) as pa,
@@ -165,7 +170,8 @@ def load_hitter_multi_year():
         JOIN players p ON hs.player_id = p.id
         JOIN teams t ON hs.team_id = t.id
         WHERE strftime('%Y', hs.date) IN ('2023', '2024', '2025')
-        GROUP BY p.mlb_id, p.name, p.birth_date, strftime('%Y', hs.date), t.name
+        GROUP BY p.mlb_id, p.name, p.birth_date, p.primary_position,
+                 strftime('%Y', hs.date), t.name
         HAVING SUM(hs.plate_appearances) >= 10
     """
     df = pd.read_sql(query, engine)
@@ -554,9 +560,9 @@ def project_pitcher(player_seasons, league_avg_era=4.20, league_avg_fip=4.20):
         recent_ip = player_seasons['ip'].mean()
     proj_ip = recent_ip * playing_time_adjustment(age_2026, role)
 
-    # Simplified WAR
+    # Pitcher WAR: based on FIP vs league average, scaled by innings
     league_fip = 4.20
-    proj_war = ((league_fip - proj_fip) / 10) * (proj_ip / 9)
+    proj_war = ((league_fip - proj_fip) / RUNS_PER_WIN) * (proj_ip / 9)
 
     return {
         'mlb_player_id': mlb_id,
@@ -577,24 +583,29 @@ def project_pitcher(player_seasons, league_avg_era=4.20, league_avg_fip=4.20):
     }
 
 
-def project_hitter(player_seasons, player_statcast=None, league_avg_woba=0.310):
+def project_hitter(player_seasons, player_statcast=None, league_avg_woba=None):
     """
-    Marcel-style projection for a single hitter, now with Statcast overlay.
+    Marcel-style projection for a single hitter, now with Statcast overlay + fWAR.
 
     Step 1: Compute the base Marcel wOBA (3-year weighted average + regression + aging)
     Step 2: If Statcast data exists, compute luck filters and apply adjustment
     Step 3: Generate bounce-back and regression-risk scores
+    Step 4: Compute fWAR with position adjustment and wRC+
 
     The Statcast layer doesn't replace Marcel — it CORRECTS it. A player who hit
     .250 with elite barrel rate and depressed BABIP gets projected higher than
     a .250 hitter with weak contact quality who got lucky on BABIP.
     """
+    if league_avg_woba is None:
+        league_avg_woba = LEAGUE_AVG_WOBA
+
     if player_seasons.empty:
         return None
 
     name = player_seasons.iloc[0]['player_name']
     mlb_id = player_seasons.iloc[0]['mlb_player_id']
     birth_date = player_seasons.iloc[0]['birth_date']
+    position = player_seasons.iloc[-1].get('primary_position', 'DH')
 
     if pd.notna(birth_date):
         age_2026 = 2026 - pd.to_datetime(birth_date).year
@@ -670,15 +681,37 @@ def project_hitter(player_seasons, player_statcast=None, league_avg_woba=0.310):
         recent_pa = player_seasons['pa'].mean()
     proj_pa = recent_pa * playing_time_adjustment(age_2026, 'hitter')
 
-    # WAR (using Statcast-adjusted wOBA for the final number)
-    woba_scale = 1.15
-    runs_per_win = 10
-    batting_runs = ((statcast_adjusted_woba - league_avg_woba) / woba_scale) * proj_pa
-    proj_war = batting_runs / runs_per_win
+    # ── wRC+ CALCULATION ──────────────────────────────────
+    # wRC+ = how many runs a hitter creates relative to league average.
+    # 100 = average, 150 = 50% better than average, etc.
+    # Formula: ((wOBA - lgWOBA) / wOBA_scale + lgR/PA) / lgR/PA * 100
+    wrc_plus = (
+        (statcast_adjusted_woba - league_avg_woba) / LEAGUE_AVG_WOBA_SCALE
+        + LEAGUE_AVG_R_PA
+    ) / LEAGUE_AVG_R_PA * 100
+
+    # ── fWAR CALCULATION (with position adjustment) ──────
+    # fWAR adds defensive value via position adjustment.
+    # A catcher with .300 wOBA is more valuable than a DH with .300 wOBA
+    # because catching is harder to fill at replacement level.
+    #
+    # Components:
+    #   1. Batting runs = (wOBA - lgWOBA) / wOBA_scale * PA
+    #   2. Position adjustment = POSITION_ADJUSTMENT_RUNS * (PA / 650)
+    #   3. fWAR = (batting_runs + position_adj) / RUNS_PER_WIN
+
+    batting_runs = ((statcast_adjusted_woba - league_avg_woba) /
+                    LEAGUE_AVG_WOBA_SCALE) * proj_pa
+
+    # Scale position adjustment by playing time (650 PA = full season)
+    pos_adj_runs = POSITION_ADJUSTMENT_RUNS.get(position, 0) * (proj_pa / 650)
+
+    proj_fwar = (batting_runs + pos_adj_runs) / RUNS_PER_WIN
 
     return {
         'mlb_player_id': mlb_id,
         'player_name': name,
+        'position': position,
         'age_2026': age_2026,
         'years_of_data': years_available,
         'total_pa_history': round(total_pa, 0),
@@ -688,11 +721,13 @@ def project_hitter(player_seasons, player_statcast=None, league_avg_woba=0.310):
         'bounce_back_score': bounce_back,
         'regression_risk_score': regression_risk,
         'key_indicator': key_indicator,
+        'wrc_plus': round(wrc_plus, 0),
         'proj_ops': round(proj_ops, 3),
         'proj_k_pct': round(proj_k_pct, 1),
         'proj_bb_pct': round(proj_bb_pct, 1),
         'proj_pa': round(proj_pa, 0),
-        'proj_war': round(proj_war, 1),
+        'proj_war': round(proj_fwar, 1),
+        'pos_adj_runs': round(pos_adj_runs, 1),
         'woba_aging_adj': round(woba_aging, 3),
         'regression_factor': round(regression_factor, 2),
     }
@@ -794,15 +829,16 @@ def run_projections(team_filter=None, player_filter=None):
             print(f"HITTER PROJECTION: {player_filter}")
             print(f"{'=' * 70}")
             for _, r in h_df_show.iterrows():
-                print(f"\n  {r['player_name']} (Age {r['age_2026']})")
+                print(f"\n  {r['player_name']} ({r['position']}, Age {r['age_2026']})")
                 print(f"  Current team: {r['current_team']}")
                 print(f"  Data: {r['years_of_data']} years, {r['total_pa_history']:.0f} career PA")
                 # Marcel vs Statcast-adjusted wOBA
                 print(f"  Marcel wOBA:    {r['marcel_woba']:.3f}")
                 print(f"  Statcast wOBA:  {r['statcast_adjusted_woba']:.3f} "
                       f"({r['statcast_adj']:+.003f} adjustment)")
-                print(f"  Projected: {r['proj_ops']:.3f} OPS | "
-                      f"{r['proj_pa']:.0f} PA | {r['proj_war']:.1f} WAR")
+                print(f"  wRC+: {r['wrc_plus']:.0f} | "
+                      f"{r['proj_pa']:.0f} PA | {r['proj_war']:.1f} fWAR "
+                      f"(pos adj: {r['pos_adj_runs']:+.1f} runs)")
                 # Statcast scores
                 print(f"  Bounce-back:    {r['bounce_back_score']}/100")
                 print(f"  Regression risk:{r['regression_risk_score']}/100")
@@ -840,7 +876,7 @@ def run_projections(team_filter=None, player_filter=None):
         # Lineup = top 9 hitters
         lineup = th.nlargest(9, 'proj_war')
 
-        proj_wins = 48 + total_war  # 48 = replacement level
+        proj_wins = REPLACEMENT_LEVEL_WINS + total_war
 
         # Average bounce-back score for team's hitters (new metric)
         avg_bb = th['bounce_back_score'].mean() if not th.empty else 50
@@ -874,8 +910,8 @@ def run_projections(team_filter=None, player_filter=None):
 
         if not lineup.empty:
             top3 = " | ".join(
-                f"{r['player_name']} ({r['statcast_adjusted_woba']:.3f} wOBA, "
-                f"{r['proj_war']:.1f}W, BB:{r['bounce_back_score']})"
+                f"{r['player_name']} ({r['position']}, {r['wrc_plus']:.0f} wRC+, "
+                f"{r['proj_war']:.1f} fWAR)"
                 for _, r in lineup.head(3).iterrows()
             )
             print(f"    Lineup:   {top3}")
