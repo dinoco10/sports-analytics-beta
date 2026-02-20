@@ -592,10 +592,147 @@ def compute_lineup_features(hitting_df, games_df, player_positions, window=BATTE
 
 
 # ═══════════════════════════════════════════════════════════════
+# LAYER 5: PROJECTION-BASED FEATURES
+# ═══════════════════════════════════════════════════════════════
+#
+# These features use static preseason projections (Marcel + Statcast)
+# as a player quality signal. The model learns: "games with better-projected
+# pitchers and lineups tend to be won more often."
+#
+# This is standard practice — PECOTA, Steamer, ZiPS all use preseason
+# projections as game-level features. The projection captures long-term
+# player quality that rolling stats miss (especially early in the season).
+
+def load_projection_maps():
+    """
+    Load pitcher and hitter projections from CSV into lookup dicts.
+    Returns:
+        pitcher_map: mlb_player_id -> {proj_war, proj_fip, proj_era}
+        hitter_map:  mlb_player_id -> {statcast_adjusted_woba, wrc_plus,
+                                        bounce_back_score, proj_war}
+    """
+    proj_dir = OUTPUT_DIR  # data/features/
+
+    pitcher_map = {}
+    hitter_map = {}
+
+    pitcher_path = proj_dir / "pitcher_projections_2026.csv"
+    if pitcher_path.exists():
+        p_df = pd.read_csv(pitcher_path)
+        for _, row in p_df.iterrows():
+            pitcher_map[row['mlb_player_id']] = {
+                'proj_war': row.get('proj_war', 0),
+                'proj_fip': row.get('proj_fip', 4.20),
+                'proj_era': row.get('proj_era', 4.20),
+            }
+        print(f"    Loaded {len(pitcher_map)} pitcher projections")
+    else:
+        print(f"    WARNING: {pitcher_path} not found. Run player_projections first.")
+
+    hitter_path = proj_dir / "hitter_projections_2026.csv"
+    if hitter_path.exists():
+        h_df = pd.read_csv(hitter_path)
+        for _, row in h_df.iterrows():
+            hitter_map[row['mlb_player_id']] = {
+                'sc_woba': row.get('statcast_adjusted_woba', 0.310),
+                'wrc_plus': row.get('wrc_plus', 100),
+                'bounce_back': row.get('bounce_back_score', 50),
+                'proj_war': row.get('proj_war', 0),
+            }
+        print(f"    Loaded {len(hitter_map)} hitter projections")
+    else:
+        print(f"    WARNING: {hitter_path} not found. Run player_projections first.")
+
+    return pitcher_map, hitter_map
+
+
+def compute_projection_features(games_df, hitting_df, pitcher_map, hitter_map):
+    """
+    For each game, look up:
+    1. Starting pitcher's projected fWAR and FIP
+    2. Lineup's average statcast_adjusted_woba and bounce-back score
+
+    Returns a DataFrame with one row per game, columns:
+    - home_proj_sp_war, away_proj_sp_war (starter quality)
+    - home_proj_sp_fip, away_proj_sp_fip (starter quality alt metric)
+    - home_proj_lineup_woba, away_proj_lineup_woba (lineup quality)
+    - home_proj_lineup_bb_score, away_proj_lineup_bb_score (upside signal)
+    - diff_proj_sp_war, diff_proj_lineup_woba (differentials)
+    """
+    results = []
+
+    # Pre-compute: for each game, which hitters appeared for each team?
+    # Build a game_id -> {team_id: [player_ids]} mapping from hitting_df
+    game_hitters = {}
+    for _, row in hitting_df.iterrows():
+        gid = row['game_id']
+        tid = row['team_id']
+        pid = row['player_id']
+        if gid not in game_hitters:
+            game_hitters[gid] = {}
+        if tid not in game_hitters[gid]:
+            game_hitters[gid][tid] = []
+        game_hitters[gid][tid].append(pid)
+
+    # Need to map internal player_id -> mlb_id for hitter lookups
+    conn = sqlite3.connect(str(DB_PATH))
+    pid_to_mlb = pd.read_sql("SELECT id, mlb_id FROM players", conn)
+    conn.close()
+    pid_map = dict(zip(pid_to_mlb['id'], pid_to_mlb['mlb_id']))
+
+    default_sp = {'proj_war': 0, 'proj_fip': 4.50, 'proj_era': 4.50}
+    default_hitter = {'sc_woba': 0.310, 'wrc_plus': 100, 'bounce_back': 50, 'proj_war': 0}
+
+    for _, game in games_df.iterrows():
+        game_id = game['game_id']
+        row = {'game_id': game_id}
+
+        for side in ['home', 'away']:
+            team_id = game[f'{side}_team_id']
+
+            # --- Starter projection ---
+            starter_id = game.get(f'{side}_starter_id')
+            if pd.notna(starter_id):
+                starter_mlb = pid_map.get(int(starter_id))
+                sp_proj = pitcher_map.get(starter_mlb, default_sp)
+            else:
+                sp_proj = default_sp
+
+            row[f'{side}_proj_sp_war'] = sp_proj['proj_war']
+            row[f'{side}_proj_sp_fip'] = sp_proj['proj_fip']
+
+            # --- Lineup projection ---
+            # Average statcast_adjusted_woba and bounce-back of hitters in this game
+            hitter_pids = game_hitters.get(game_id, {}).get(team_id, [])
+            wobas = []
+            bb_scores = []
+
+            for pid in hitter_pids:
+                mlb_id = pid_map.get(pid)
+                if mlb_id and mlb_id in hitter_map:
+                    h_proj = hitter_map[mlb_id]
+                    wobas.append(h_proj['sc_woba'])
+                    bb_scores.append(h_proj['bounce_back'])
+
+            row[f'{side}_proj_lineup_woba'] = np.mean(wobas) if wobas else 0.310
+            row[f'{side}_proj_lineup_bb_score'] = np.mean(bb_scores) if bb_scores else 50
+
+        # Differentials
+        row['diff_proj_sp_war'] = row['home_proj_sp_war'] - row['away_proj_sp_war']
+        row['diff_proj_sp_fip'] = row['away_proj_sp_fip'] - row['home_proj_sp_fip']  # Lower FIP = better
+        row['diff_proj_lineup_woba'] = row['home_proj_lineup_woba'] - row['away_proj_lineup_woba']
+
+        results.append(row)
+
+    return pd.DataFrame(results)
+
+
+# ═══════════════════════════════════════════════════════════════
 # ASSEMBLY
 # ═══════════════════════════════════════════════════════════════
 
-def assemble_game_features(games_df, team_features, sp_features, bp_features, lineup_features=None):
+def assemble_game_features(games_df, team_features, sp_features, bp_features,
+                           lineup_features=None, projection_features=None):
     """Merge all feature layers into a single game-level matrix."""
     
     result = games_df[["game_id", "mlb_game_id", "date", "season",
@@ -689,6 +826,14 @@ def assemble_game_features(games_df, team_features, sp_features, bp_features, li
                 on="game_id", how="left"
             )
     
+    # --- Projection features (Layer 5) ---
+    if projection_features is not None and len(projection_features) > 0:
+        proj_cols = [c for c in projection_features.columns if c != 'game_id']
+        result = result.merge(
+            projection_features[['game_id'] + proj_cols],
+            on='game_id', how='left'
+        )
+
     # --- Derived difference features ---
     for window in TEAM_WINDOWS:
         sfx = f"_t{window}"
@@ -757,8 +902,9 @@ def main():
     print(f"  Generated {len(bp_features)} bullpen feature rows")
     
     lineup_features = None
+    hitters = None
     if not args.skip_lineup:
-        print("\n[6/7] Computing lineup features...")
+        print("\n[6/8] Computing lineup features...")
         try:
             hitters = load_hitting_stats(conn)
             print(f"  Loaded {len(hitters)} hitter game lines")
@@ -769,11 +915,31 @@ def main():
         except Exception as e:
             print(f"  Lineup features skipped: {e}")
     else:
-        print("\n[6/7] Skipping lineup features (--skip-lineup)")
-    
+        print("\n[6/8] Skipping lineup features (--skip-lineup)")
+
+    # Layer 5: Projection-based features
+    projection_features = None
+    print("\n[7/8] Computing projection features (Layer 5)...")
+    try:
+        pitcher_map, hitter_map = load_projection_maps()
+        if pitcher_map and hitter_map:
+            if hitters is None:
+                hitters = load_hitting_stats(conn)
+            projection_features = compute_projection_features(
+                games, hitters, pitcher_map, hitter_map
+            )
+            print(f"  Generated {len(projection_features)} projection feature rows")
+        else:
+            print("  Skipped — no projection CSVs available")
+    except Exception as e:
+        print(f"  Projection features skipped: {e}")
+
     # ---- Assemble ----
-    print("\n[7/7] Assembling game feature matrix...")
-    game_features = assemble_game_features(games, team_features, sp_features, bp_features, lineup_features)
+    print("\n[8/8] Assembling game feature matrix...")
+    game_features = assemble_game_features(
+        games, team_features, sp_features, bp_features,
+        lineup_features, projection_features
+    )
     
     if args.season:
         game_features = game_features[game_features["season"] == args.season]

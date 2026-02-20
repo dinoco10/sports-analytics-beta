@@ -87,6 +87,12 @@ def get_feature_layers():
             "description": "Average OBP and SLG of starting 9 batters",
             "patterns": ["lineup_obp", "lineup_slg"],
         },
+        5: {
+            "name": "+ Projections",
+            "description": "Marcel+Statcast SP WAR/FIP and lineup projected wOBA",
+            "patterns": ["proj_sp_war", "proj_sp_fip",
+                         "proj_lineup_woba", "proj_lineup_bb_score"],
+        },
     }
     return layers
 
@@ -257,7 +263,7 @@ def shap_analysis(model, X_test, feature_names, top_n=15):
 
 def main():
     parser = argparse.ArgumentParser(description="Train win probability model")
-    parser.add_argument("--layer", type=int, default=4, help="Max feature layer (1-4)")
+    parser.add_argument("--layer", type=int, default=5, help="Max feature layer (1-5)")
     parser.add_argument("--test-season", type=int, default=2025, help="Test season")
     parser.add_argument("--all-layers", action="store_true", help="Train each layer incrementally")
     parser.add_argument("--max-depth", type=int, default=2, help="Tree max depth")
