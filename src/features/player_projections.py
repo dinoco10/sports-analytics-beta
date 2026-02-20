@@ -187,6 +187,291 @@ def load_hitter_multi_year():
 
 
 # ═══════════════════════════════════════════════════════════════
+# STATCAST DATA LOADING + REGRESSION SIGNALS
+# ═══════════════════════════════════════════════════════════════
+
+def load_statcast_multi_year():
+    """
+    Load Statcast metrics for 2023-2025 from our player_statcast_metrics table.
+    Returns a DataFrame with one row per player per season, keyed on mlb_player_id.
+
+    This gives us the "underlying quality" data that traditional stats miss:
+    - Expected stats (xwOBA, xBA, xSLG) show what SHOULD have happened
+    - Contact quality (barrel rate, hard hit %) shows real bat quality
+    - Plate discipline (chase rate, whiff rate) is the most stable signal
+    """
+    query = """
+        SELECT
+            p.mlb_id as mlb_player_id,
+            sm.season,
+            sm.avg_exit_velocity, sm.barrel_rate, sm.hard_hit_rate,
+            sm.xwoba, sm.xslg, sm.xba,
+            sm.launch_angle_sweet_spot_pct,
+            sm.babip, sm.woba, sm.slg, sm.ba, sm.hr_per_fb,
+            sm.k_rate, sm.bb_rate, sm.chase_rate, sm.whiff_rate,
+            sm.z_contact_rate,
+            sm.pull_air_rate, sm.gb_rate, sm.fb_rate, sm.ld_rate,
+            sm.pa as statcast_pa
+        FROM player_statcast_metrics sm
+        JOIN players p ON sm.player_id = p.id
+        WHERE sm.season IN (2023, 2024, 2025)
+    """
+    df = pd.read_sql(query, engine)
+    print(f"  Statcast records loaded: {len(df)}")
+    return df
+
+
+def compute_luck_filters(player_statcast):
+    """
+    Calculate "luck filters" — gaps between expected and actual performance.
+    These are the core regression signals that tell us if a player was lucky/unlucky.
+
+    A player with xwOBA >> wOBA had hard contact that didn't fall for hits.
+    That's BABIP luck, not a skill change. Expect regression UPWARD.
+
+    Returns a dict with luck metrics for the most recent season available.
+
+    Key signals:
+    - babip_vs_career: negative = unlucky, expect bounce back
+    - xba_minus_ba: positive = unlucky (expected BA higher than actual)
+    - xslg_minus_slg: positive = unlucky power
+    - hr_per_fb_vs_norm: negative = HR due for regression up (league norm ~11-13%)
+    """
+    if player_statcast.empty:
+        return {}
+
+    # Career averages (weighted by PA across available seasons)
+    career_babip = player_statcast['babip'].mean()
+    career_hr_per_fb = player_statcast['hr_per_fb'].mean()
+
+    # Most recent season's luck gaps
+    recent = player_statcast.sort_values('season').iloc[-1]
+
+    result = {}
+
+    # BABIP vs career average — if current BABIP is below career, expect regression up
+    if pd.notna(recent.get('babip')) and pd.notna(career_babip):
+        result['babip_vs_career'] = round(recent['babip'] - career_babip, 3)
+
+    # xBA minus actual BA — positive means unlucky (xBA > BA)
+    if pd.notna(recent.get('xba')) and pd.notna(recent.get('ba')):
+        result['xba_minus_ba'] = round(recent['xba'] - recent['ba'], 3)
+
+    # xSLG minus actual SLG — positive means unlucky power
+    if pd.notna(recent.get('xslg')) and pd.notna(recent.get('slg')):
+        result['xslg_minus_slg'] = round(recent['xslg'] - recent['slg'], 3)
+
+    # HR/FB vs career norm — league average is ~11-13%, if below career, expect regression up
+    if pd.notna(recent.get('hr_per_fb')) and pd.notna(career_hr_per_fb):
+        result['hr_per_fb_vs_career'] = round(recent['hr_per_fb'] - career_hr_per_fb, 3)
+
+    # xwOBA minus actual wOBA — the single best luck indicator
+    if pd.notna(recent.get('xwoba')) and pd.notna(recent.get('woba')):
+        result['xwoba_minus_woba'] = round(recent['xwoba'] - recent['woba'], 3)
+
+    return result
+
+
+def statcast_adjustment(marcel_woba, player_statcast, luck_filters):
+    """
+    Apply Statcast regression signals to adjust the Marcel base projection.
+
+    This is the key innovation: Marcel gives us a solid 3-year weighted average,
+    but it treats every .250 hitter the same. Statcast tells us WHICH .250 hitters
+    actually hit the ball hard (unlucky) vs which made weak contact (lucky).
+
+    Adjustment rules (each capped to prevent extreme swings):
+    1. xwOBA >> wOBA AND BABIP below career → project upward (max +.020 wOBA)
+    2. Barrel rate + hard hit rate stable/improving → trust/boost projection
+    3. Pull air rate trending up → add HR upside (power development signal)
+    4. Chase rate increasing → flag risk, reduce projection (approach declining)
+
+    Returns: wOBA adjustment value (positive = upside, negative = downside)
+    """
+    if player_statcast.empty:
+        return 0.0
+
+    adjustment = 0.0
+    recent = player_statcast.sort_values('season').iloc[-1]
+
+    # --- RULE 1: xwOBA/BABIP luck correction ---
+    # If xwOBA is significantly higher than actual wOBA AND BABIP is depressed,
+    # the player was genuinely unlucky — not a skill issue
+    xwoba_gap = luck_filters.get('xwoba_minus_woba', 0)
+    babip_gap = luck_filters.get('babip_vs_career', 0)
+
+    if xwoba_gap > 0.010 and babip_gap < -0.010:
+        # Both signals agree: unlucky. Weight by the gap size.
+        # Cap at +0.020 wOBA to avoid overreacting
+        luck_adj = min(xwoba_gap * 0.5, 0.020)
+        adjustment += luck_adj
+    elif xwoba_gap < -0.010 and babip_gap > 0.010:
+        # Lucky — actual stats were inflated. Regress downward.
+        luck_adj = max(xwoba_gap * 0.4, -0.015)
+        adjustment += luck_adj
+
+    # --- RULE 2: Contact quality stability ---
+    # If barrel rate and hard hit rate are stable or improving across years,
+    # the underlying bat quality is real — trust the projection
+    if len(player_statcast) >= 2:
+        sorted_sc = player_statcast.sort_values('season')
+        recent_barrel = sorted_sc.iloc[-1].get('barrel_rate')
+        prev_barrel = sorted_sc.iloc[-2].get('barrel_rate')
+
+        if pd.notna(recent_barrel) and pd.notna(prev_barrel):
+            barrel_trend = recent_barrel - prev_barrel
+            if barrel_trend > 1.0:
+                # Improving barrel rate = real power development (+0.005 to +0.010)
+                adjustment += min(barrel_trend * 0.003, 0.010)
+            elif barrel_trend < -2.0:
+                # Declining barrel rate = real skill erosion
+                adjustment += max(barrel_trend * 0.002, -0.008)
+
+    # --- RULE 3: Pull air rate trend (HR predictor) ---
+    # Pulled fly balls are the #1 predictor of future home runs.
+    # If a hitter is pulling more balls in the air, power is coming.
+    if len(player_statcast) >= 2:
+        sorted_sc = player_statcast.sort_values('season')
+        recent_pull = sorted_sc.iloc[-1].get('pull_air_rate')
+        prev_pull = sorted_sc.iloc[-2].get('pull_air_rate')
+
+        if pd.notna(recent_pull) and pd.notna(prev_pull):
+            pull_trend = recent_pull - prev_pull
+            if pull_trend > 2.0:
+                # More pulled fly balls = HR upside
+                adjustment += min(pull_trend * 0.002, 0.008)
+
+    # --- RULE 4: Chase rate risk ---
+    # Chase rate (O-Swing%) is the most stable discipline metric.
+    # If it's increasing, the hitter is chasing more pitches outside the zone.
+    # This is a REAL skill change, not noise. Reduce projection.
+    if len(player_statcast) >= 2:
+        sorted_sc = player_statcast.sort_values('season')
+        recent_chase = sorted_sc.iloc[-1].get('chase_rate')
+        prev_chase = sorted_sc.iloc[-2].get('chase_rate')
+
+        if pd.notna(recent_chase) and pd.notna(prev_chase):
+            chase_trend = recent_chase - prev_chase
+            if chase_trend > 2.0:
+                # Chasing more = approach deteriorating
+                adjustment -= min(chase_trend * 0.002, 0.010)
+            elif chase_trend < -2.0:
+                # Chasing less = approach improving (discipline breakout)
+                adjustment += min(abs(chase_trend) * 0.001, 0.005)
+
+    # Final cap: never adjust more than +/- 0.030 wOBA
+    adjustment = max(-0.030, min(0.030, adjustment))
+    return round(adjustment, 3)
+
+
+def compute_scores(player_statcast, luck_filters, sc_adjustment):
+    """
+    Compute bounce-back score and regression risk score (both 0-100).
+    Also identify the single most important stat driving the projection.
+
+    bounce_back_score: How much upside vs surface stats (high = buy low candidate)
+    regression_risk_score: How much downside risk (high = sell high candidate)
+    key_indicator: The one stat that matters most for this player's projection
+
+    These scores feed directly into the content creation framework:
+    - Bounce-back > 70 → "The surface numbers lied" article candidate
+    - Regression risk > 70 → "Why X's 2025 Numbers Lied To You" candidate
+    """
+    bounce_back = 50  # Neutral starting point
+    regression_risk = 50
+    indicators = {}  # stat_name -> weight (highest weight = key indicator)
+
+    if not luck_filters and player_statcast.empty:
+        return 50, 50, "insufficient_data"
+
+    recent = player_statcast.sort_values('season').iloc[-1] if not player_statcast.empty else {}
+
+    # --- Luck signals (biggest impact on bounce-back score) ---
+    xwoba_gap = luck_filters.get('xwoba_minus_woba', 0)
+    babip_gap = luck_filters.get('babip_vs_career', 0)
+
+    # xwOBA gap: positive = unlucky = bounce-back candidate
+    if xwoba_gap > 0.020:
+        bounce_back += min(xwoba_gap * 500, 25)  # Up to +25 points
+        indicators['xwoba_gap'] = abs(xwoba_gap) * 500
+    elif xwoba_gap < -0.020:
+        regression_risk += min(abs(xwoba_gap) * 500, 25)
+        indicators['xwoba_gap'] = abs(xwoba_gap) * 500
+
+    # BABIP gap: negative = unlucky = bounce-back candidate
+    if babip_gap < -0.020:
+        bounce_back += min(abs(babip_gap) * 300, 15)
+        indicators['babip_vs_career'] = abs(babip_gap) * 300
+    elif babip_gap > 0.020:
+        regression_risk += min(babip_gap * 300, 15)
+        indicators['babip_vs_career'] = abs(babip_gap) * 300
+
+    # --- Contact quality signals ---
+    if pd.notna(recent.get('barrel_rate')):
+        barrel = recent['barrel_rate']
+        if barrel > 12:  # Elite barrel rate
+            bounce_back += 8
+            indicators['barrel_rate'] = 8
+        elif barrel < 4:  # Poor contact quality
+            regression_risk += 8
+            indicators['barrel_rate'] = 8
+
+    if pd.notna(recent.get('hard_hit_rate')):
+        hh = recent['hard_hit_rate']
+        if hh > 45:  # Elite hard hit rate
+            bounce_back += 5
+        elif hh < 30:  # Weak contact
+            regression_risk += 5
+
+    # --- Discipline signals ---
+    if pd.notna(recent.get('chase_rate')):
+        chase = recent['chase_rate']
+        if chase > 35:  # High chase rate = real risk
+            regression_risk += 10
+            indicators['chase_rate'] = 10
+        elif chase < 25:  # Elite discipline
+            bounce_back += 5
+            indicators['chase_rate'] = 5
+
+    if pd.notna(recent.get('z_contact_rate')):
+        z_contact = recent['z_contact_rate']
+        if z_contact > 88:  # Elite zone contact
+            bounce_back += 5
+        elif z_contact < 78:  # Poor contact on strikes
+            regression_risk += 5
+
+    # --- Trend signals (if we have multi-year data) ---
+    if len(player_statcast) >= 2:
+        sorted_sc = player_statcast.sort_values('season')
+        recent_pull = sorted_sc.iloc[-1].get('pull_air_rate')
+        prev_pull = sorted_sc.iloc[-2].get('pull_air_rate')
+
+        if pd.notna(recent_pull) and pd.notna(prev_pull):
+            pull_trend = recent_pull - prev_pull
+            if pull_trend > 3:
+                bounce_back += 5
+                indicators['pull_air_trend'] = 5
+
+    # Incorporate the statcast adjustment direction
+    if sc_adjustment > 0.010:
+        bounce_back += 10
+    elif sc_adjustment < -0.010:
+        regression_risk += 10
+
+    # Clamp to 0-100
+    bounce_back = max(0, min(100, round(bounce_back)))
+    regression_risk = max(0, min(100, round(regression_risk)))
+
+    # Identify key indicator (highest weight)
+    if indicators:
+        key_indicator = max(indicators, key=indicators.get)
+    else:
+        key_indicator = "no_statcast_data"
+
+    return bounce_back, regression_risk, key_indicator
+
+
+# ═══════════════════════════════════════════════════════════════
 # MARCEL PROJECTION ENGINE
 # ═══════════════════════════════════════════════════════════════
 
@@ -292,8 +577,18 @@ def project_pitcher(player_seasons, league_avg_era=4.20, league_avg_fip=4.20):
     }
 
 
-def project_hitter(player_seasons, league_avg_woba=0.310):
-    """Marcel-style projection for a single hitter."""
+def project_hitter(player_seasons, player_statcast=None, league_avg_woba=0.310):
+    """
+    Marcel-style projection for a single hitter, now with Statcast overlay.
+
+    Step 1: Compute the base Marcel wOBA (3-year weighted average + regression + aging)
+    Step 2: If Statcast data exists, compute luck filters and apply adjustment
+    Step 3: Generate bounce-back and regression-risk scores
+
+    The Statcast layer doesn't replace Marcel — it CORRECTS it. A player who hit
+    .250 with elite barrel rate and depressed BABIP gets projected higher than
+    a .250 hitter with weak contact quality who got lucky on BABIP.
+    """
     if player_seasons.empty:
         return None
 
@@ -338,14 +633,36 @@ def project_hitter(player_seasons, league_avg_woba=0.310):
     proj_k_pct = weighted_k_pct / total_weight
     proj_bb_pct = weighted_bb_pct / total_weight
 
-    # Regression
+    # Regression to mean
     total_pa = player_seasons['pa'].sum()
     regression_factor = min(total_pa / 1500, 1.0)
     proj_woba = proj_woba * regression_factor + league_avg_woba * (1 - regression_factor)
 
-    # Aging
+    # Aging adjustment
     woba_aging = hitter_aging_adjustment(age_2026)
     proj_woba += woba_aging
+
+    # This is the pure Marcel projection BEFORE Statcast
+    marcel_woba = round(proj_woba, 3)
+
+    # ── STATCAST OVERLAY ──────────────────────────────────
+    # Layer Statcast on top of Marcel as regression signals.
+    # If no Statcast data, these default to neutral values.
+    sc_adj = 0.0
+    bounce_back = 50
+    regression_risk = 50
+    key_indicator = "no_statcast_data"
+    luck = {}
+
+    if player_statcast is not None and not player_statcast.empty:
+        luck = compute_luck_filters(player_statcast)
+        sc_adj = statcast_adjustment(marcel_woba, player_statcast, luck)
+        bounce_back, regression_risk, key_indicator = compute_scores(
+            player_statcast, luck, sc_adj
+        )
+
+    # Apply Statcast adjustment to get final projected wOBA
+    statcast_adjusted_woba = round(proj_woba + sc_adj, 3)
 
     # Projected PA
     recent_pa = player_seasons[player_seasons['season'] == 2025]['pa'].sum()
@@ -353,10 +670,10 @@ def project_hitter(player_seasons, league_avg_woba=0.310):
         recent_pa = player_seasons['pa'].mean()
     proj_pa = recent_pa * playing_time_adjustment(age_2026, 'hitter')
 
-    # WAR
+    # WAR (using Statcast-adjusted wOBA for the final number)
     woba_scale = 1.15
     runs_per_win = 10
-    batting_runs = ((proj_woba - league_avg_woba) / woba_scale) * proj_pa
+    batting_runs = ((statcast_adjusted_woba - league_avg_woba) / woba_scale) * proj_pa
     proj_war = batting_runs / runs_per_win
 
     return {
@@ -365,7 +682,12 @@ def project_hitter(player_seasons, league_avg_woba=0.310):
         'age_2026': age_2026,
         'years_of_data': years_available,
         'total_pa_history': round(total_pa, 0),
-        'proj_woba': round(proj_woba, 3),
+        'marcel_woba': marcel_woba,
+        'statcast_adjusted_woba': statcast_adjusted_woba,
+        'statcast_adj': round(sc_adj, 3),
+        'bounce_back_score': bounce_back,
+        'regression_risk_score': regression_risk,
+        'key_indicator': key_indicator,
         'proj_ops': round(proj_ops, 3),
         'proj_k_pct': round(proj_k_pct, 1),
         'proj_bb_pct': round(proj_bb_pct, 1),
@@ -381,10 +703,14 @@ def project_hitter(player_seasons, league_avg_woba=0.310):
 # ═══════════════════════════════════════════════════════════════
 
 def run_projections(team_filter=None, player_filter=None):
-    """Project all players and aggregate by current 2026 team."""
+    """
+    Project all players and aggregate by current 2026 team.
+    Now loads Statcast data and passes it to hitter projections
+    for luck-adjusted wOBA, bounce-back scores, and regression risk.
+    """
 
     print("=" * 70)
-    print("2026 PLAYER PROJECTIONS (Marcel Method + Aging Curves)")
+    print("2026 PLAYER PROJECTIONS (Marcel + Statcast Regression Signals)")
     print("=" * 70)
 
     # Load multi-year data
@@ -393,6 +719,10 @@ def run_projections(team_filter=None, player_filter=None):
     hitters_raw = load_hitter_multi_year()
     print(f"  Pitcher-seasons: {len(pitchers_raw)}")
     print(f"  Hitter-seasons:  {len(hitters_raw)}")
+
+    # Load Statcast data (new in Phase 2)
+    print("\nLoading Statcast metrics...")
+    statcast_raw = load_statcast_multi_year()
 
     # Get current rosters
     print("\nFetching current 2026 rosters...")
@@ -409,7 +739,7 @@ def run_projections(team_filter=None, player_filter=None):
 
     print(f"  Players on 2026 rosters: {len(roster_map)}")
 
-    # Project pitchers
+    # Project pitchers (unchanged — Statcast hitter-only for now)
     print("\nProjecting pitchers...")
     pitcher_projections = []
     for pid, group in pitchers_raw.groupby('mlb_player_id'):
@@ -421,19 +751,26 @@ def run_projections(team_filter=None, player_filter=None):
     p_df = pd.DataFrame(pitcher_projections)
     print(f"  Projected {len(p_df)} pitchers")
 
-    # Project hitters
-    print("Projecting hitters...")
+    # Project hitters WITH Statcast overlay
+    print("Projecting hitters (with Statcast adjustment)...")
     hitter_projections = []
+    statcast_hits = 0
+
     for pid, group in hitters_raw.groupby('mlb_player_id'):
-        proj = project_hitter(group)
+        # Get this player's Statcast data across all seasons
+        player_sc = statcast_raw[statcast_raw['mlb_player_id'] == pid]
+
+        proj = project_hitter(group, player_statcast=player_sc)
         if proj:
             proj['current_team'] = roster_map.get(pid, 'Free Agent')
             hitter_projections.append(proj)
+            if not player_sc.empty:
+                statcast_hits += 1
 
     h_df = pd.DataFrame(hitter_projections)
-    print(f"  Projected {len(h_df)} hitters")
+    print(f"  Projected {len(h_df)} hitters ({statcast_hits} with Statcast data)")
 
-    # Filter if requested
+    # Filter if requested — show individual player projection
     if player_filter:
         p_df_show = p_df[p_df['player_name'].str.contains(player_filter, case=False)]
         h_df_show = h_df[h_df['player_name'].str.contains(player_filter, case=False)]
@@ -460,15 +797,23 @@ def run_projections(team_filter=None, player_filter=None):
                 print(f"\n  {r['player_name']} (Age {r['age_2026']})")
                 print(f"  Current team: {r['current_team']}")
                 print(f"  Data: {r['years_of_data']} years, {r['total_pa_history']:.0f} career PA")
-                print(f"  Projected: {r['proj_woba']:.3f} wOBA | {r['proj_ops']:.3f} OPS")
-                print(f"  Projected: {r['proj_pa']:.0f} PA | {r['proj_war']:.1f} WAR")
+                # Marcel vs Statcast-adjusted wOBA
+                print(f"  Marcel wOBA:    {r['marcel_woba']:.3f}")
+                print(f"  Statcast wOBA:  {r['statcast_adjusted_woba']:.3f} "
+                      f"({r['statcast_adj']:+.003f} adjustment)")
+                print(f"  Projected: {r['proj_ops']:.3f} OPS | "
+                      f"{r['proj_pa']:.0f} PA | {r['proj_war']:.1f} WAR")
+                # Statcast scores
+                print(f"  Bounce-back:    {r['bounce_back_score']}/100")
+                print(f"  Regression risk:{r['regression_risk_score']}/100")
+                print(f"  Key indicator:  {r['key_indicator']}")
                 print(f"  Aging adj: {r['woba_aging_adj']:+.003f} wOBA | "
                       f"Regression: {r['regression_factor']:.0%} confidence")
         return p_df, h_df
 
     # Team aggregation
     print(f"\n{'=' * 70}")
-    print("2026 PROJECTED TEAM WAR (aging-adjusted)")
+    print("2026 PROJECTED TEAM WAR (Marcel + Statcast)")
     print(f"{'=' * 70}")
 
     team_results = []
@@ -497,16 +842,21 @@ def run_projections(team_filter=None, player_filter=None):
 
         proj_wins = 48 + total_war  # 48 = replacement level
 
+        # Average bounce-back score for team's hitters (new metric)
+        avg_bb = th['bounce_back_score'].mean() if not th.empty else 50
+
         team_results.append({
             'team': team,
             'proj_wins': round(proj_wins, 0),
             'total_war': round(total_war, 1),
             'pitch_war': round(p_war, 1),
             'hit_war': round(h_war, 1),
+            'avg_bounce_back': round(avg_bb, 0),
         })
 
-        print(f"\n  {team} — Projected {proj_wins:.0f}W (WAR: {total_war:.1f})")
-        print(f"    Pitching: {p_war:.1f} WAR | Hitting: {h_war:.1f} WAR")
+        print(f"\n  {team} -- Projected {proj_wins:.0f}W (WAR: {total_war:.1f})")
+        print(f"    Pitching: {p_war:.1f} WAR | Hitting: {h_war:.1f} WAR "
+              f"| Avg bounce-back: {avg_bb:.0f}/100")
 
         if not sp.empty:
             sp_str = " | ".join(
@@ -524,7 +874,8 @@ def run_projections(team_filter=None, player_filter=None):
 
         if not lineup.empty:
             top3 = " | ".join(
-                f"{r['player_name']} ({r['proj_woba']:.3f} wOBA, {r['proj_war']:.1f}W, age {r['age_2026']})"
+                f"{r['player_name']} ({r['statcast_adjusted_woba']:.3f} wOBA, "
+                f"{r['proj_war']:.1f}W, BB:{r['bounce_back_score']})"
                 for _, r in lineup.head(3).iterrows()
             )
             print(f"    Lineup:   {top3}")
