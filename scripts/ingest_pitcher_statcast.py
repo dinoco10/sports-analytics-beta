@@ -264,6 +264,210 @@ def fetch_pitcher_arsenal(season, min_pa=50):
 
 
 # ═══════════════════════════════════════════════════════════════
+# DATA SOURCE 5: Spin Rate (avg spin per pitch type)
+# ═══════════════════════════════════════════════════════════════
+
+def fetch_pitcher_spin_rate(season, min_pitches=50):
+    """
+    Pull average spin rate per pitch type via pybaseball.
+    Uses statcast_pitcher_pitch_arsenal with arsenal_type='avg_spin'.
+    Returns DataFrame with columns: mlb_player_id, pitch_type, avg_spin.
+    """
+    from pybaseball import statcast_pitcher_pitch_arsenal
+
+    print(f"  Fetching pitcher spin rate for {season} (min pitches={min_pitches})...")
+
+    try:
+        spin_df = statcast_pitcher_pitch_arsenal(season, minP=min_pitches,
+                                                  arsenal_type='avg_spin')
+        time.sleep(1)
+    except Exception as e:
+        print(f"    --> Spin rate data unavailable: {e}")
+        return pd.DataFrame()
+
+    if spin_df.empty:
+        print("    --> No spin rate data returned")
+        return pd.DataFrame()
+
+    spin_df = spin_df.rename(columns={'pitcher': 'mlb_player_id'})
+
+    # Melt from wide format (ff_avg_spin, sl_avg_spin, ...) to long format
+    pitch_type_spin_cols = {
+        'FF': 'ff_avg_spin', 'SI': 'si_avg_spin', 'FC': 'fc_avg_spin',
+        'SL': 'sl_avg_spin', 'CH': 'ch_avg_spin', 'CU': 'cu_avg_spin',
+        'FS': 'fs_avg_spin', 'KN': 'kn_avg_spin', 'ST': 'st_avg_spin',
+        'SV': 'sv_avg_spin',
+    }
+
+    records = []
+    for _, row in spin_df.iterrows():
+        pid = row['mlb_player_id']
+        for ptype, col in pitch_type_spin_cols.items():
+            if col in spin_df.columns and pd.notna(row.get(col)):
+                records.append({
+                    'mlb_player_id': pid,
+                    'pitch_type': ptype,
+                    'avg_spin': row[col],
+                })
+
+    result = pd.DataFrame(records)
+    print(f"    --> {len(result)} pitch-type spin records across "
+          f"{result['mlb_player_id'].nunique()} pitchers")
+    return result
+
+
+# ═══════════════════════════════════════════════════════════════
+# DATA SOURCE 6: Induced Vertical Break (IVB) from Savant
+# ═══════════════════════════════════════════════════════════════
+
+def fetch_pitcher_ivb(season, min_pitches=100):
+    """
+    Pull induced vertical break (IVB) per pitch type from Baseball Savant
+    pitch-movement leaderboard. IVB measures how much a pitch defies gravity.
+
+    Higher IVB on fastballs = more "rise" = harder to hit.
+    Returns DataFrame: mlb_player_id, pitch_type, induced_vertical_break.
+    """
+    print(f"  Fetching IVB data for {season} (min pitches={min_pitches})...")
+
+    # Pitch types to fetch IVB for
+    pitch_types = ['FF', 'SI', 'SL', 'CH', 'CU', 'FC', 'ST', 'SV', 'FS']
+    all_records = []
+
+    for pt in pitch_types:
+        url = (
+            f"https://baseballsavant.mlb.com/leaderboard/pitch-movement"
+            f"?year={season}&pitch_type={pt}&min={min_pitches}&csv=true"
+        )
+        try:
+            r = requests.get(url, timeout=30)
+            if r.status_code != 200 or len(r.text) < 100:
+                continue
+            df = pd.read_csv(io.StringIO(r.text))
+
+            # The IVB column is 'pitcher_break_z_induced' (inches)
+            if 'pitcher_break_z_induced' not in df.columns:
+                # Try alternate column names
+                ivb_col = None
+                for c in df.columns:
+                    if 'break_z' in c.lower() and 'induced' in c.lower():
+                        ivb_col = c
+                        break
+                if ivb_col is None:
+                    continue
+            else:
+                ivb_col = 'pitcher_break_z_induced'
+
+            # Find the pitcher ID column
+            pid_col = None
+            for c in ['pitcher_id', 'player_id', 'pitcher']:
+                if c in df.columns:
+                    pid_col = c
+                    break
+            if pid_col is None:
+                continue
+
+            for _, row in df.iterrows():
+                pid = row.get(pid_col)
+                ivb = row.get(ivb_col)
+                if pd.notna(pid) and pd.notna(ivb):
+                    all_records.append({
+                        'mlb_player_id': int(pid),
+                        'pitch_type': pt,
+                        'induced_vertical_break': float(ivb),
+                    })
+
+        except Exception as e:
+            print(f"    --> IVB fetch failed for {pt}: {e}")
+
+        time.sleep(1)  # Rate limit: 1s between requests
+
+    result = pd.DataFrame(all_records) if all_records else pd.DataFrame()
+    if not result.empty:
+        print(f"    --> {len(result)} IVB records across "
+              f"{result['mlb_player_id'].nunique()} pitchers")
+    else:
+        print("    --> No IVB data retrieved")
+    return result
+
+
+# ═══════════════════════════════════════════════════════════════
+# ARSENAL DEPTH COMPUTATION
+# ═══════════════════════════════════════════════════════════════
+
+def compute_arsenal_depth(arsenal_df, mlb_player_id):
+    """
+    Compute arsenal summary metrics for one pitcher:
+    - arsenal_depth_score: count of pitches with usage>10% AND run_value_per_100 < 0
+    - fastball_velocity: avg_speed of primary fastball (FF or SI, higher usage)
+    - best_secondary_rv: lowest (best) run_value_per_100 among non-FB pitches
+
+    Returns dict with the three fields.
+    """
+    pitcher_df = arsenal_df[arsenal_df['mlb_player_id'] == mlb_player_id]
+
+    if pitcher_df.empty:
+        return {'arsenal_depth_score': None, 'fastball_velocity': None,
+                'best_secondary_rv': None}
+
+    # Arsenal depth: count of meaningful + effective pitches
+    meaningful = pitcher_df[pitcher_df['usage_pct'] > 10]
+    effective = meaningful[meaningful['run_value_per_100'] < 0]
+    depth_score = len(effective)
+
+    # Primary fastball velocity (FF or SI, whichever has higher usage)
+    fb_types = pitcher_df[pitcher_df['pitch_type'].isin(['FF', 'SI'])]
+    if not fb_types.empty:
+        primary_fb = fb_types.loc[fb_types['usage_pct'].idxmax()]
+        fb_velo = primary_fb.get('avg_speed')
+    else:
+        fb_velo = None
+
+    # Best secondary pitch run value (non-fastball)
+    secondaries = pitcher_df[~pitcher_df['pitch_type'].isin(['FF', 'SI'])]
+    if not secondaries.empty:
+        best_rv = secondaries['run_value_per_100'].min()
+    else:
+        best_rv = None
+
+    return {
+        'arsenal_depth_score': float(depth_score),
+        'fastball_velocity': float(fb_velo) if pd.notna(fb_velo) else None,
+        'best_secondary_rv': float(best_rv) if pd.notna(best_rv) else None,
+    }
+
+
+# ═══════════════════════════════════════════════════════════════
+# DB MIGRATION: Add new columns if they don't exist
+# ═══════════════════════════════════════════════════════════════
+
+def ensure_new_columns():
+    """
+    Add new columns to existing tables if they don't exist.
+    Idempotent — safe to run multiple times.
+    """
+    alter_statements = [
+        # PitcherPitchMetrics — spin rate and IVB
+        "ALTER TABLE pitcher_pitch_metrics ADD COLUMN avg_spin FLOAT",
+        "ALTER TABLE pitcher_pitch_metrics ADD COLUMN induced_vertical_break FLOAT",
+        # PitcherStatcastMetrics — arsenal summary
+        "ALTER TABLE pitcher_statcast_metrics ADD COLUMN arsenal_depth_score FLOAT",
+        "ALTER TABLE pitcher_statcast_metrics ADD COLUMN fastball_velocity FLOAT",
+        "ALTER TABLE pitcher_statcast_metrics ADD COLUMN best_secondary_rv FLOAT",
+    ]
+
+    with engine.connect() as conn:
+        for stmt in alter_statements:
+            try:
+                conn.execute(text(stmt))
+                col_name = stmt.split("ADD COLUMN ")[1].split(" ")[0]
+                print(f"  Added column: {col_name}")
+            except Exception:
+                pass  # Column already exists
+        conn.commit()
+
+
+# ═══════════════════════════════════════════════════════════════
 # MERGE + STORE
 # ═══════════════════════════════════════════════════════════════
 
@@ -286,7 +490,7 @@ def _safe_float(val):
 
 def ingest_season(season, min_pa=50):
     """
-    Pull all four data sources for one season, merge, and store.
+    Pull all six data sources for one season, merge, and store.
     Season-level metrics go into pitcher_statcast_metrics.
     Per-pitch metrics go into pitcher_pitch_metrics.
     """
@@ -299,6 +503,24 @@ def ingest_season(season, min_pa=50):
     barrels_df = fetch_pitcher_exit_velo_barrels(season, min_bbe=30)
     discipline_df = fetch_pitcher_discipline(season, min_pa)
     arsenal_df = fetch_pitcher_arsenal(season, min_pa)
+    spin_df = fetch_pitcher_spin_rate(season, min_pitches=50)
+    ivb_df = fetch_pitcher_ivb(season, min_pitches=100)
+
+    # Merge spin rate into arsenal_df (per pitch type)
+    if not spin_df.empty:
+        arsenal_df = arsenal_df.merge(
+            spin_df, on=['mlb_player_id', 'pitch_type'], how='left'
+        )
+    if 'avg_spin' not in arsenal_df.columns:
+        arsenal_df['avg_spin'] = np.nan
+
+    # Merge IVB into arsenal_df (per pitch type)
+    if not ivb_df.empty:
+        arsenal_df = arsenal_df.merge(
+            ivb_df, on=['mlb_player_id', 'pitch_type'], how='left'
+        )
+    if 'induced_vertical_break' not in arsenal_df.columns:
+        arsenal_df['induced_vertical_break'] = np.nan
 
     # Merge season-level: expected as base, left join others
     merged = expected_df.merge(barrels_df, on='mlb_player_id', how='left')
@@ -363,6 +585,12 @@ def ingest_season(season, min_pa=50):
             # Metadata
             record.pa_against = int(row['pa']) if pd.notna(row.get('pa')) else None
 
+            # Arsenal summary (computed from pitch-level data)
+            arsenal_summary = compute_arsenal_depth(arsenal_df, row['mlb_player_id'])
+            record.arsenal_depth_score = _safe_float(arsenal_summary.get('arsenal_depth_score'))
+            record.fastball_velocity = _safe_float(arsenal_summary.get('fastball_velocity'))
+            record.best_secondary_rv = _safe_float(arsenal_summary.get('best_secondary_rv'))
+
             if not existing:
                 session.add(record)
             stored_season += 1
@@ -406,6 +634,8 @@ def ingest_season(season, min_pa=50):
             record.woba_against = _safe_float(row.get('woba_against'))
             record.hard_hit_pct = _safe_float(row.get('hard_hit_pct'))
             record.avg_speed = _safe_float(row.get('avg_speed'))
+            record.avg_spin = _safe_float(row.get('avg_spin'))
+            record.induced_vertical_break = _safe_float(row.get('induced_vertical_break'))
             record.xwoba_against = _safe_float(row.get('xwoba_against'))
 
             if not existing:
@@ -467,6 +697,20 @@ def show_summary():
         print(f"\n  Total season-level records: {total}")
         print(f"  Total pitch-level records: {pitch_count}")
 
+        # New fields coverage
+        spin_count = conn.execute(text(
+            "SELECT COUNT(*) FROM pitcher_pitch_metrics WHERE avg_spin IS NOT NULL"
+        )).scalar()
+        ivb_count = conn.execute(text(
+            "SELECT COUNT(*) FROM pitcher_pitch_metrics WHERE induced_vertical_break IS NOT NULL"
+        )).scalar()
+        arsenal_count = conn.execute(text(
+            "SELECT COUNT(*) FROM pitcher_statcast_metrics WHERE arsenal_depth_score IS NOT NULL"
+        )).scalar()
+        print(f"\n  Pitch records with spin rate: {spin_count}/{pitch_count}")
+        print(f"  Pitch records with IVB: {ivb_count}/{pitch_count}")
+        print(f"  Season records with arsenal depth: {arsenal_count}/{total}")
+
 
 # ═══════════════════════════════════════════════════════════════
 # MAIN
@@ -482,6 +726,11 @@ if __name__ == "__main__":
     parser.add_argument("--summary", action="store_true",
                         help="Show current DB contents")
     args = parser.parse_args()
+
+    # Ensure new columns exist before ingesting
+    if not args.summary:
+        print("\nChecking for new DB columns...")
+        ensure_new_columns()
 
     if args.summary:
         show_summary()

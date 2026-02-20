@@ -324,6 +324,11 @@ class PitcherStatcastMetrics(Base):
     pa_against = Column(Integer)                # Plate appearances faced
     ip = Column(Float)                          # Innings pitched (for min threshold)
 
+    # Arsenal summary (computed from pitch-level data)
+    arsenal_depth_score = Column(Float)         # Count of pitches w/ usage>10% AND RV<0
+    fastball_velocity = Column(Float)           # Avg speed of primary fastball (FF/SI)
+    best_secondary_rv = Column(Float)           # Best (lowest) RV/100 among non-FB pitches
+
     __table_args__ = (
         UniqueConstraint("player_id", "season", name="uq_pitcher_statcast_player_season"),
         Index("idx_pitcher_statcast_season", "season"),
@@ -368,6 +373,8 @@ class PitcherPitchMetrics(Base):
 
     # Physical properties
     avg_speed = Column(Float)                         # Average velocity (mph)
+    avg_spin = Column(Float)                          # Average spin rate (rpm)
+    induced_vertical_break = Column(Float)            # IVB in inches (higher = more rise)
     xwoba_against = Column(Float)                     # Expected wOBA against this pitch
 
     __table_args__ = (
