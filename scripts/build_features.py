@@ -592,6 +592,93 @@ def compute_lineup_features(hitting_df, games_df, player_positions, window=BATTE
 
 
 # ═══════════════════════════════════════════════════════════════
+# LAYER 6c: HOME/AWAY SPLITS (venue-specific rolling stats)
+# ═══════════════════════════════════════════════════════════════
+#
+# Current rolling stats mix home and away games.  Some teams play
+# significantly differently at home vs on the road (park effects,
+# comfort, travel fatigue).  This layer computes venue-specific
+# rolling win%, RS, and RA using only home-only or away-only games.
+
+SPLIT_WINDOW = 30  # last 30 venue-specific games (~half a season)
+
+def compute_home_away_splits(games_df):
+    """
+    For each team, compute rolling stats using ONLY their home games
+    or ONLY their away games. This captures venue-specific performance.
+
+    Output columns (per game):
+    - home_venue_wpct: home team's win% in their recent home games
+    - away_venue_wpct: away team's win% in their recent away games
+    - home_venue_rs / home_venue_ra: runs at home
+    - away_venue_rs / away_venue_ra: runs on road
+    - diff_venue_wpct: home_venue_wpct - away_venue_wpct
+    """
+    # Build team game logs split by venue
+    rows = []
+    for _, game in games_df.iterrows():
+        for side in ["home", "away"]:
+            team_id = game[f"{side}_team_id"]
+            won = (game["home_win"] == 1) if side == "home" else (game["home_win"] == 0)
+            rs = game["home_score"] if side == "home" else game["away_score"]
+            ra = game["away_score"] if side == "home" else game["home_score"]
+            rows.append({
+                "game_id": game["game_id"],
+                "date": game["date"],
+                "season": game["season"],
+                "team_id": team_id,
+                "side": side,
+                "won": int(won),
+                "rs": rs,
+                "ra": ra,
+            })
+
+    tg = pd.DataFrame(rows)
+
+    results = []
+    for side in ["home", "away"]:
+        # Filter to only games where this team played in this venue role
+        venue_games = tg[tg["side"] == side].copy()
+        venue_games = venue_games.sort_values(["team_id", "season", "date", "game_id"])
+
+        all_venue = []
+        for team_id, group in venue_games.groupby("team_id"):
+            group = group.reset_index(drop=True)
+
+            # Rolling stats using only venue-specific games, shifted by 1
+            group[f"{side}_venue_wpct"] = (
+                group["won"].shift(1)
+                .rolling(window=SPLIT_WINDOW, min_periods=3).mean()
+            )
+            group[f"{side}_venue_rs"] = (
+                group["rs"].shift(1)
+                .rolling(window=SPLIT_WINDOW, min_periods=3).mean()
+            )
+            group[f"{side}_venue_ra"] = (
+                group["ra"].shift(1)
+                .rolling(window=SPLIT_WINDOW, min_periods=3).mean()
+            )
+
+            all_venue.append(group[["game_id", f"{side}_venue_wpct",
+                                     f"{side}_venue_rs", f"{side}_venue_ra"]])
+
+        results.append(pd.concat(all_venue, ignore_index=True))
+
+    # Merge home-side and away-side results
+    result = results[0].merge(results[1], on="game_id", how="outer")
+
+    # Diff: home team's home form vs away team's road form
+    result["diff_venue_wpct"] = result["home_venue_wpct"] - result["away_venue_wpct"]
+    result["diff_venue_rs"] = result["home_venue_rs"] - result["away_venue_rs"]
+
+    n_computed = result["home_venue_wpct"].notna().sum()
+    print(f"  Computed venue splits for {n_computed}/{len(result)} games "
+          f"(min 3 venue-specific games required)")
+
+    return result
+
+
+# ═══════════════════════════════════════════════════════════════
 # LAYER 6a: REST DAYS (computed from game dates)
 # ═══════════════════════════════════════════════════════════════
 #
@@ -782,6 +869,9 @@ def load_projection_maps():
                 'sustainability_score': row.get('sustainability_score', 50),
                 'breakout_score': row.get('breakout_score', 50),
                 'proj_k_bb_pct': row.get('proj_k_bb_pct', 10.0),
+                'proj_arsenal_depth': row.get('proj_arsenal_depth', 1.5),
+                'proj_fb_velocity': row.get('proj_fb_velocity', 93.9),
+                'proj_fb_ivb': row.get('proj_fb_ivb', 12.8),
             }
         print(f"    Loaded {len(pitcher_map)} pitcher projections")
     else:
@@ -840,7 +930,9 @@ def compute_projection_features(games_df, hitting_df, pitcher_map, hitter_map):
 
     default_sp = {'proj_war': 0, 'proj_fip': 4.50, 'proj_era': 4.50,
                   'statcast_adjusted_era': 4.50, 'sustainability_score': 50,
-                  'breakout_score': 50, 'proj_k_bb_pct': 10.0}
+                  'breakout_score': 50, 'proj_k_bb_pct': 10.0,
+                  'proj_arsenal_depth': 1.5, 'proj_fb_velocity': 93.9,
+                  'proj_fb_ivb': 12.8}
     default_hitter = {'sc_woba': 0.310, 'wrc_plus': 100, 'bounce_back': 50, 'proj_war': 0}
 
     for _, game in games_df.iterrows():
@@ -864,6 +956,9 @@ def compute_projection_features(games_df, hitting_df, pitcher_map, hitter_map):
             row[f'{side}_proj_sp_sust'] = sp_proj['sustainability_score']
             row[f'{side}_proj_sp_breakout'] = sp_proj['breakout_score']
             row[f'{side}_proj_sp_k_bb'] = sp_proj['proj_k_bb_pct']
+            row[f'{side}_proj_sp_arsenal'] = sp_proj['proj_arsenal_depth']
+            row[f'{side}_proj_sp_velo'] = sp_proj['proj_fb_velocity']
+            row[f'{side}_proj_sp_ivb'] = sp_proj['proj_fb_ivb']
 
             # --- Lineup projection ---
             # Average statcast_adjusted_woba and bounce-back of hitters in this game
@@ -887,6 +982,9 @@ def compute_projection_features(games_df, hitting_df, pitcher_map, hitter_map):
         row['diff_proj_sp_sc_era'] = row['away_proj_sp_sc_era'] - row['home_proj_sp_sc_era']  # Lower ERA = better
         row['diff_proj_sp_sust'] = row['home_proj_sp_sust'] - row['away_proj_sp_sust']
         row['diff_proj_sp_k_bb'] = row['home_proj_sp_k_bb'] - row['away_proj_sp_k_bb']
+        row['diff_proj_sp_arsenal'] = row['home_proj_sp_arsenal'] - row['away_proj_sp_arsenal']
+        row['diff_proj_sp_velo'] = row['home_proj_sp_velo'] - row['away_proj_sp_velo']
+        row['diff_proj_sp_ivb'] = row['home_proj_sp_ivb'] - row['away_proj_sp_ivb']
         row['diff_proj_lineup_woba'] = row['home_proj_lineup_woba'] - row['away_proj_lineup_woba']
 
         results.append(row)
@@ -900,7 +998,8 @@ def compute_projection_features(games_df, hitting_df, pitcher_map, hitter_map):
 
 def assemble_game_features(games_df, team_features, sp_features, bp_features,
                            lineup_features=None, projection_features=None,
-                           rest_days_df=None, handedness_df=None):
+                           rest_days_df=None, handedness_df=None,
+                           venue_splits_df=None):
     """Merge all feature layers into a single game-level matrix."""
 
     result = games_df[["game_id", "mlb_game_id", "date", "season",
@@ -1009,6 +1108,14 @@ def assemble_game_features(games_df, team_features, sp_features, bp_features,
             on="game_id", how="left"
         )
 
+    # --- Venue splits (Layer 6c) ---
+    if venue_splits_df is not None and len(venue_splits_df) > 0:
+        split_cols = [c for c in venue_splits_df.columns if c != "game_id"]
+        result = result.merge(
+            venue_splits_df[["game_id"] + split_cols],
+            on="game_id", how="left"
+        )
+
     # --- Handedness matchups (Layer 6b) ---
     if handedness_df is not None and len(handedness_df) > 0:
         result = result.merge(
@@ -1111,7 +1218,7 @@ def main():
     lineup_features = None
     hitters = None
     if not args.skip_lineup:
-        print("\n[6/10] Computing lineup features...")
+        print("\n[6/11] Computing lineup features...")
         try:
             hitters = load_hitting_stats(conn)
             print(f"  Loaded {len(hitters)} hitter game lines")
@@ -1122,11 +1229,11 @@ def main():
         except Exception as e:
             print(f"  Lineup features skipped: {e}")
     else:
-        print("\n[6/10] Skipping lineup features (--skip-lineup)")
+        print("\n[6/11] Skipping lineup features (--skip-lineup)")
 
     # Layer 5: Projection-based features
     projection_features = None
-    print("\n[7/10] Computing projection features (Layer 5)...")
+    print("\n[7/11] Computing projection features (Layer 5)...")
     try:
         pitcher_map, hitter_map = load_projection_maps()
         if pitcher_map and hitter_map:
@@ -1143,7 +1250,7 @@ def main():
 
     # Layer 6a: Rest days (computed from game dates)
     rest_days_df = None
-    print("\n[8/10] Computing rest days (Layer 6a)...")
+    print("\n[8/11] Computing rest days (Layer 6a)...")
     try:
         rest_days_df = compute_rest_days(games)
     except Exception as e:
@@ -1151,7 +1258,7 @@ def main():
 
     # Layer 6b: Handedness matchups (platoon advantage)
     handedness_df = None
-    print("\n[9/10] Computing handedness features (Layer 6b)...")
+    print("\n[9/11] Computing handedness features (Layer 6b)...")
     try:
         if hitters is None:
             hitters = load_hitting_stats(conn)
@@ -1159,12 +1266,20 @@ def main():
     except Exception as e:
         print(f"  Handedness features skipped: {e}")
 
+    # Layer 6c: Home/away venue splits
+    venue_splits_df = None
+    print("\n[10/11] Computing home/away venue splits (Layer 6c)...")
+    try:
+        venue_splits_df = compute_home_away_splits(games)
+    except Exception as e:
+        print(f"  Venue splits skipped: {e}")
+
     # ---- Assemble ----
-    print("\n[10/10] Assembling game feature matrix...")
+    print("\n[11/11] Assembling game feature matrix...")
     game_features = assemble_game_features(
         games, team_features, sp_features, bp_features,
         lineup_features, projection_features,
-        rest_days_df, handedness_df
+        rest_days_df, handedness_df, venue_splits_df
     )
     
     if args.season:
