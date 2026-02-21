@@ -628,6 +628,9 @@ def load_projection_maps():
                 'sustainability_score': row.get('sustainability_score', 50),
                 'breakout_score': row.get('breakout_score', 50),
                 'proj_k_bb_pct': row.get('proj_k_bb_pct', 10.0),
+                'proj_arsenal_depth': row.get('proj_arsenal_depth', 1.5),
+                'proj_fb_velocity': row.get('proj_fb_velocity', 93.9),
+                'proj_fb_ivb': row.get('proj_fb_ivb', 12.8),
             }
         print(f"    Loaded {len(pitcher_map)} pitcher projections")
     else:
@@ -686,7 +689,9 @@ def compute_projection_features(games_df, hitting_df, pitcher_map, hitter_map):
 
     default_sp = {'proj_war': 0, 'proj_fip': 4.50, 'proj_era': 4.50,
                   'statcast_adjusted_era': 4.50, 'sustainability_score': 50,
-                  'breakout_score': 50, 'proj_k_bb_pct': 10.0}
+                  'breakout_score': 50, 'proj_k_bb_pct': 10.0,
+                  'proj_arsenal_depth': 1.5, 'proj_fb_velocity': 93.9,
+                  'proj_fb_ivb': 12.8}
     default_hitter = {'sc_woba': 0.310, 'wrc_plus': 100, 'bounce_back': 50, 'proj_war': 0}
 
     for _, game in games_df.iterrows():
@@ -710,6 +715,9 @@ def compute_projection_features(games_df, hitting_df, pitcher_map, hitter_map):
             row[f'{side}_proj_sp_sust'] = sp_proj['sustainability_score']
             row[f'{side}_proj_sp_breakout'] = sp_proj['breakout_score']
             row[f'{side}_proj_sp_k_bb'] = sp_proj['proj_k_bb_pct']
+            row[f'{side}_proj_sp_arsenal'] = sp_proj['proj_arsenal_depth']
+            row[f'{side}_proj_sp_velo'] = sp_proj['proj_fb_velocity']
+            row[f'{side}_proj_sp_ivb'] = sp_proj['proj_fb_ivb']
 
             # --- Lineup projection ---
             # Average statcast_adjusted_woba and bounce-back of hitters in this game
@@ -733,6 +741,9 @@ def compute_projection_features(games_df, hitting_df, pitcher_map, hitter_map):
         row['diff_proj_sp_sc_era'] = row['away_proj_sp_sc_era'] - row['home_proj_sp_sc_era']  # Lower ERA = better
         row['diff_proj_sp_sust'] = row['home_proj_sp_sust'] - row['away_proj_sp_sust']
         row['diff_proj_sp_k_bb'] = row['home_proj_sp_k_bb'] - row['away_proj_sp_k_bb']
+        row['diff_proj_sp_arsenal'] = row['home_proj_sp_arsenal'] - row['away_proj_sp_arsenal']
+        row['diff_proj_sp_velo'] = row['home_proj_sp_velo'] - row['away_proj_sp_velo']
+        row['diff_proj_sp_ivb'] = row['home_proj_sp_ivb'] - row['away_proj_sp_ivb']
         row['diff_proj_lineup_woba'] = row['home_proj_lineup_woba'] - row['away_proj_lineup_woba']
 
         results.append(row)

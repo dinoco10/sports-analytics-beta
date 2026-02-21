@@ -141,6 +141,7 @@ def get_feature_layers():
             "description": "Marcel+Statcast SP WAR/FIP/ERA/sustainability/K-BB and lineup projected wOBA",
             "patterns": ["proj_sp_war", "proj_sp_fip", "proj_sp_sc_era",
                          "proj_sp_sust", "proj_sp_breakout", "proj_sp_k_bb",
+                         "proj_sp_arsenal", "proj_sp_velo", "proj_sp_ivb",
                          "proj_lineup_woba", "proj_lineup_bb_score"],
         },
     }

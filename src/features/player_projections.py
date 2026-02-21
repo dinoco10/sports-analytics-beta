@@ -500,7 +500,8 @@ def load_pitcher_statcast_multi_year():
             pm.whiff_rate, pm.swstr_rate,
             pm.chase_rate_induced, pm.z_contact_rate_against,
             pm.pull_air_rate_against, pm.gb_rate, pm.fb_rate, pm.ld_rate,
-            pm.pa_against, pm.ip
+            pm.pa_against, pm.pa_against as statcast_pa, pm.ip,
+            pm.arsenal_depth_score, pm.fastball_velocity, pm.best_secondary_rv
         FROM pitcher_statcast_metrics pm
         JOIN players p ON pm.player_id = p.id
         WHERE pm.season IN (2023, 2024, 2025)
@@ -528,7 +529,8 @@ def load_pitcher_pitch_metrics():
             pp.run_value_per_100, pp.run_value, pp.pitches_thrown,
             pp.usage_pct, pp.whiff_rate, pp.chase_rate,
             pp.ba_against, pp.slg_against, pp.woba_against,
-            pp.hard_hit_pct, pp.avg_speed, pp.xwoba_against
+            pp.hard_hit_pct, pp.avg_speed, pp.xwoba_against,
+            pp.avg_spin, pp.induced_vertical_break
         FROM pitcher_pitch_metrics pp
         JOIN players p ON pp.player_id = p.id
         WHERE pp.season IN (2023, 2024, 2025)
@@ -1153,6 +1155,7 @@ def project_pitcher(player_seasons, pitcher_statcast=None, pitch_metrics=None,
             'chase_rate_induced', 'z_contact_rate_against',
             'pull_air_rate_against', 'gb_rate', 'fb_rate', 'ld_rate',
             'babip_against', 'hr_per_fb', 'k_minus_bb',
+            'arsenal_depth_score', 'fastball_velocity', 'best_secondary_rv',
         ]
         marcel_sc = marcel_weight_statcast(
             pitcher_statcast, pitcher_sc_metrics,
@@ -1187,6 +1190,26 @@ def project_pitcher(player_seasons, pitcher_statcast=None, pitch_metrics=None,
     league_fip = 4.20
     proj_war = ((league_fip - proj_fip) / RUNS_PER_WIN) * (proj_ip / 9)
 
+    # Compute Marcel-weighted fastball IVB from pitch-level data.
+    # Uses year weights 5/4/3 on the fastball (FF/SI) IVB, weighted by pitches thrown.
+    proj_fb_ivb = 12.8  # league average default
+    if pitch_metrics is not None and not pitch_metrics.empty:
+        fb_pm = pitch_metrics[
+            (pitch_metrics['pitch_type'].isin(['FF', 'SI'])) &
+            (pitch_metrics['induced_vertical_break'].notna())
+        ]
+        if not fb_pm.empty:
+            year_wts = {2025: 5, 2024: 4, 2023: 3}
+            w_sum, ivb_sum = 0.0, 0.0
+            for _, row in fb_pm.iterrows():
+                yw = year_wts.get(row['season'], 0)
+                pitches = row.get('pitches_thrown', 100) or 100
+                w = yw * pitches
+                w_sum += w
+                ivb_sum += w * row['induced_vertical_break']
+            if w_sum > 0:
+                proj_fb_ivb = round(ivb_sum / w_sum, 1)
+
     return {
         'mlb_player_id': mlb_id,
         'player_name': name,
@@ -1217,6 +1240,10 @@ def project_pitcher(player_seasons, pitcher_statcast=None, pitch_metrics=None,
         'proj_xera': round(marcel_sc.get('xera', 4.20), 2),
         'proj_whiff_rate': round(marcel_sc.get('whiff_rate', 25.0), 1),
         'proj_gb_rate': round(marcel_sc.get('gb_rate', 43.0), 1),
+        # Arsenal quality features (from PR #12 data)
+        'proj_arsenal_depth': round(marcel_sc.get('arsenal_depth_score', 1.5), 1),
+        'proj_fb_velocity': round(marcel_sc.get('fastball_velocity', 93.9), 1),
+        'proj_fb_ivb': proj_fb_ivb,
     }
 
 

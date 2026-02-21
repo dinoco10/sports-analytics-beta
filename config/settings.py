@@ -118,6 +118,9 @@ LEAGUE_AVG_STATCAST_PITCHER = {
     'babip_against': 0.300,
     'hr_per_fb': 12.0,
     'k_minus_bb': 10.0,          # K-BB% league average
+    'arsenal_depth_score': 1.5,   # Avg pitches with usage>10% AND RV<0
+    'fastball_velocity': 93.9,    # Avg fastball velocity (FF/SI)
+    'best_secondary_rv': -0.63,   # Avg best secondary run value per 100
 }
 
 # ─── Betting (Phase 3) ───────────────────────────────────
