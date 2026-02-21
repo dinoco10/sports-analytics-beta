@@ -21,6 +21,10 @@ import json
 import sys
 from pathlib import Path
 
+# Fix Windows cp1252 encoding crashes when printing special characters
+if sys.stdout.encoding and sys.stdout.encoding.lower().startswith("cp"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+
 import lightgbm as lgb
 import numpy as np
 import pandas as pd
@@ -512,38 +516,153 @@ def step2_benchmark():
 # ---------------------------------------------------------------------------
 
 def step3_ensemble(merged: pd.DataFrame):
-    """STEP 3: Blend model and Vegas probabilities (80% Vegas, 20% model)."""
+    """STEP 3: Optimized ensemble — grid search weights + meta-learner.
+
+    Three approaches tested:
+    1. Grid search over blend weights (model_weight from 0% to 100%)
+    2. Logistic regression meta-learner on [Vegas prob, Model prob]
+    3. LightGBM meta-learner with Vegas prob + model prob + edge features
+    """
     print("\n" + "=" * 60)
-    print("STEP 3 — 80/20 Ensemble (Vegas 80% / Model 20%)")
+    print("STEP 3 — Ensemble Optimization")
     print("=" * 60)
 
+    eps = 1e-6
     y_true = merged["home_win"]
     vegas = merged["vegas_home_prob"]
     model = merged["model_home_prob"]
-    ensemble = 0.80 * vegas + 0.20 * model
 
-    eps = 1e-6
+    # --- 3a. Grid search blend weights ---
+    # Test model weights from 0% to 100% in 5% increments
+    print("\n  3a. Grid search blend weights:")
+    print(f"  {'Model %':>8} {'Vegas %':>8} {'Log Loss':>10} {'Accuracy':>10}")
+    print(f"  {'-'*38}")
 
-    results = {}
-    for name, probs in [("Model", model), ("Vegas", vegas), ("Ensemble", ensemble)]:
+    best_weight = 0.0
+    best_ll = float("inf")
+    weight_results = []
+
+    for model_pct in range(0, 105, 5):
+        w = model_pct / 100.0
+        blend = w * model + (1 - w) * vegas
+        ll = log_loss(y_true, blend.clip(eps, 1 - eps))
+        acc = accuracy_score(y_true, (blend > 0.5).astype(int))
+        weight_results.append((model_pct, ll, acc))
+        if ll < best_ll:
+            best_ll = ll
+            best_weight = w
+
+    # Print top results around the optimum
+    weight_results.sort(key=lambda x: x[1])
+    for pct, ll, acc in weight_results[:8]:
+        marker = " <<<" if pct == int(best_weight * 100) else ""
+        print(f"  {pct:>7}% {100 - pct:>7}% {ll:>10.6f} {acc:>10.4f}{marker}")
+
+    best_blend = best_weight * model + (1 - best_weight) * vegas
+    print(f"\n  Best blend: {int(best_weight*100)}% model / "
+          f"{int((1-best_weight)*100)}% Vegas -> LL={best_ll:.6f}")
+
+    # --- 3b. Logistic regression meta-learner ---
+    # Train on pre-2025 data, test on 2025
+    print("\n  3b. Logistic regression meta-learner:")
+
+    from sklearn.linear_model import LogisticRegression
+
+    # Build meta-features for the full merged dataset
+    meta_X = pd.DataFrame({
+        "vegas_prob": vegas,
+        "model_prob": model,
+        "edge": model - vegas,
+        "abs_edge": (model - vegas).abs(),
+    })
+
+    # We need to split by season within the merged data
+    # merged has a "season" column from the odds table
+    if "season" in merged.columns:
+        train_mask = merged["season"] < 2025
+        test_mask = merged["season"] == 2025
+    else:
+        # Fallback: use last 30% as test
+        n = len(merged)
+        train_mask = pd.Series([True] * int(n * 0.7) + [False] * (n - int(n * 0.7)))
+        test_mask = ~train_mask
+
+    if train_mask.sum() > 0 and test_mask.sum() > 0:
+        X_meta_train = meta_X[train_mask]
+        y_meta_train = y_true[train_mask]
+        X_meta_test = meta_X[test_mask]
+        y_meta_test = y_true[test_mask]
+
+        lr = LogisticRegression(C=1.0, max_iter=1000)
+        lr.fit(X_meta_train, y_meta_train)
+        lr_probs = lr.predict_proba(X_meta_test)[:, 1]
+        lr_ll = log_loss(y_meta_test, lr_probs.clip(eps, 1 - eps))
+        lr_acc = accuracy_score(y_meta_test, (lr_probs > 0.5).astype(int))
+
+        print(f"  LR meta-learner: LL={lr_ll:.6f}, acc={lr_acc:.4f}")
+        print(f"  Coefficients: vegas={lr.coef_[0][0]:.3f}, "
+              f"model={lr.coef_[0][1]:.3f}, "
+              f"edge={lr.coef_[0][2]:.3f}, "
+              f"abs_edge={lr.coef_[0][3]:.3f}")
+    else:
+        lr_probs = None
+        lr_ll = float("inf")
+        print("  Skipped — not enough train/test data")
+
+    # --- 3c. LightGBM meta-learner ---
+    print("\n  3c. LightGBM meta-learner:")
+
+    if train_mask.sum() > 100 and test_mask.sum() > 0:
+        meta_model = lgb.LGBMClassifier(
+            objective="binary", metric="binary_logloss",
+            max_depth=1, num_leaves=2, learning_rate=0.05,
+            n_estimators=200, min_child_samples=100,
+            reg_alpha=1.0, reg_lambda=2.0, verbose=-1,
+        )
+        meta_model.fit(X_meta_train, y_meta_train)
+        lgb_probs = meta_model.predict_proba(X_meta_test)[:, 1]
+        lgb_ll = log_loss(y_meta_test, lgb_probs.clip(eps, 1 - eps))
+        lgb_acc = accuracy_score(y_meta_test, (lgb_probs > 0.5).astype(int))
+        print(f"  LGB meta-learner: LL={lgb_ll:.6f}, acc={lgb_acc:.4f}")
+
+        # Feature importance
+        for feat, imp in zip(meta_X.columns, meta_model.feature_importances_):
+            print(f"    {feat}: {imp}")
+    else:
+        lgb_probs = None
+        lgb_ll = float("inf")
+        print("  Skipped — not enough data")
+
+    # --- Summary ---
+    print(f"\n  {'='*50}")
+    print(f"  ENSEMBLE SUMMARY (2025 test set)")
+    print(f"  {'='*50}")
+
+    # Compare all approaches on the same test set
+    approaches = [
+        ("Model only", model[test_mask] if test_mask.sum() > 0 else model),
+        ("Vegas only", vegas[test_mask] if test_mask.sum() > 0 else vegas),
+        (f"Blend ({int(best_weight*100)}/{int((1-best_weight)*100)})",
+         best_blend[test_mask] if test_mask.sum() > 0 else best_blend),
+    ]
+    if lr_probs is not None:
+        approaches.append(("LR meta", pd.Series(lr_probs, index=y_meta_test.index)))
+    if lgb_probs is not None:
+        approaches.append(("LGB meta", pd.Series(lgb_probs, index=y_meta_test.index)))
+
+    y_test_actual = y_meta_test if test_mask.sum() > 0 else y_true
+
+    print(f"\n  {'System':<25} {'Log Loss':>10} {'Accuracy':>10} {'Brier':>10}")
+    print(f"  {'-'*55}")
+    for name, probs in approaches:
         clipped = probs.clip(eps, 1 - eps)
-        results[name] = {
-            "log_loss": log_loss(y_true, clipped),
-            "accuracy": accuracy_score(y_true, (probs > 0.5).astype(int)),
-            "brier": brier_score_loss(y_true, clipped),
-        }
+        ll = log_loss(y_test_actual, clipped)
+        acc = accuracy_score(y_test_actual, (probs > 0.5).astype(int))
+        brier = brier_score_loss(y_test_actual, clipped)
+        print(f"  {name:<25} {ll:>10.6f} {acc:>10.4f} {brier:>10.4f}")
 
-    print(f"\n  {'System':<12} {'Log Loss':>10} {'Accuracy':>10} {'Brier':>10}")
-    print(f"  {'-'*42}")
-    for name, m in results.items():
-        print(f"  {name:<12} {m['log_loss']:>10.4f} {m['accuracy']:>10.4f} "
-              f"{m['brier']:>10.4f}")
-
-    # Find best
-    best = min(results, key=lambda k: results[k]["log_loss"])
-    print(f"\n  Best log loss: {best} ({results[best]['log_loss']:.4f})")
-
-    return ensemble
+    # Return the best ensemble for downstream steps
+    return best_blend
 
 
 # ---------------------------------------------------------------------------

@@ -208,6 +208,216 @@ class HittingGameStats(Base):
 
 
 # ═══════════════════════════════════════════════════════════
+# STATCAST METRICS (Season-Level from Baseball Savant)
+# ═══════════════════════════════════════════════════════════
+
+class PlayerStatcastMetrics(Base):
+    """
+    Season-level Statcast metrics per player, sourced from pybaseball.
+    One row per player per season. Used as regression signals in Marcel projections.
+
+    Categories:
+    - Contact quality: exit velo, barrel rate, hard hit %, expected stats
+    - Plate discipline: K%, BB%, chase rate, whiff rate, zone contact
+    - Batted ball profile: GB/FB/LD rates, pull air rate
+    - BABIP for luck filtering
+    """
+    __tablename__ = "player_statcast_metrics"
+
+    id = Column(Integer, primary_key=True)
+    player_id = Column(Integer, ForeignKey("players.id"), nullable=False)
+    season = Column(Integer, nullable=False)
+
+    # Contact quality
+    avg_exit_velocity = Column(Float)      # Average exit velocity (mph)
+    barrel_rate = Column(Float)            # Barrels per batted ball event
+    hard_hit_rate = Column(Float)          # Balls 95+ mph / BBE
+    xwoba = Column(Float)                  # Expected weighted on-base average
+    xslg = Column(Float)                   # Expected slugging
+    xba = Column(Float)                    # Expected batting average
+    launch_angle_sweet_spot_pct = Column(Float)  # Balls 8-32 degrees / BBE
+
+    # Actual stats (for luck gap calculations)
+    babip = Column(Float)                  # Batting average on balls in play
+    woba = Column(Float)                   # Actual wOBA (to compare vs xwOBA)
+    slg = Column(Float)                    # Actual SLG (to compare vs xSLG)
+    ba = Column(Float)                     # Actual BA (to compare vs xBA)
+    hr_per_fb = Column(Float)              # HR / fly balls ratio
+
+    # Plate discipline
+    k_rate = Column(Float)                 # Strikeout rate
+    bb_rate = Column(Float)                # Walk rate
+    chase_rate = Column(Float)             # O-Swing% — swinging outside zone
+    whiff_rate = Column(Float)             # Swinging strike rate
+    z_contact_rate = Column(Float)         # Contact on strikes (elite 85%+)
+
+    # Batted ball profile
+    pull_air_rate = Column(Float)          # Pulled fly balls — best HR predictor
+    gb_rate = Column(Float)                # Ground ball %
+    fb_rate = Column(Float)                # Fly ball %
+    ld_rate = Column(Float)                # Line drive %
+
+    # Metadata
+    pa = Column(Integer)                   # Plate appearances (for min threshold)
+
+    __table_args__ = (
+        UniqueConstraint("player_id", "season", name="uq_statcast_player_season"),
+        Index("idx_statcast_season", "season"),
+    )
+
+    def __repr__(self):
+        return f"<Statcast {self.player_id} {self.season}: xwOBA={self.xwoba}>"
+
+
+# ═══════════════════════════════════════════════════════════
+# PITCHER STATCAST METRICS (Season-Level + Pitch-Level)
+# ═══════════════════════════════════════════════════════════
+
+class PitcherStatcastMetrics(Base):
+    """
+    Season-level Statcast metrics per pitcher, sourced from Baseball Savant.
+    One row per pitcher per season. Used as regression signals in Marcel projections.
+
+    Categories:
+    - Contact suppression: exit velo against, barrel rate, hard hit %, xwOBA against
+    - Overperformance signals: ERA vs xERA, BABIP against, HR/FB%
+    - Swing & miss: whiff%, K-BB%, chase rate induced, SwStr%
+    - Batted ball profile: GB/FB/LD rates, pull air rate against (key HR predictor)
+    """
+    __tablename__ = "pitcher_statcast_metrics"
+
+    id = Column(Integer, primary_key=True)
+    player_id = Column(Integer, ForeignKey("players.id"), nullable=False)
+    season = Column(Integer, nullable=False)
+
+    # Contact suppression
+    avg_exit_velocity_against = Column(Float)   # Avg EV allowed (lower = better)
+    barrel_rate_against = Column(Float)         # Barrels per BBE allowed (lower = better)
+    hard_hit_rate_against = Column(Float)       # Balls 95+ mph allowed (lower = better)
+    xwoba_against = Column(Float)               # Expected wOBA allowed
+    xslg_against = Column(Float)                # Expected SLG allowed
+    xba_against = Column(Float)                 # Expected BA allowed
+    xera = Column(Float)                        # Expected ERA (strips BABIP/HR luck)
+
+    # Actual stats (for overperformance gaps)
+    era = Column(Float)                         # Actual ERA
+    woba_against = Column(Float)                # Actual wOBA allowed
+    babip_against = Column(Float)               # BABIP allowed (~.300 league avg)
+    hr_per_fb = Column(Float)                   # HR/FB% (regresses to 11-13%)
+
+    # Swing & miss ability
+    k_rate = Column(Float)                      # Strikeout rate
+    bb_rate = Column(Float)                     # Walk rate
+    k_minus_bb = Column(Float)                  # K-BB% (<10% = heavy BABIP dependence)
+    whiff_rate = Column(Float)                  # Overall whiff %
+    swstr_rate = Column(Float)                  # Swinging strike % (<8.6% = bottom 5)
+    chase_rate_induced = Column(Float)          # O-Swing% induced (higher = better)
+    z_contact_rate_against = Column(Float)      # Contact on strikes (lower = better)
+
+    # Batted ball profile
+    pull_air_rate_against = Column(Float)       # Pulled fly balls allowed (KEY: 66% of HR)
+    gb_rate = Column(Float)                     # Ground ball % (higher generally better)
+    fb_rate = Column(Float)                     # Fly ball % (>39% = red flag)
+    ld_rate = Column(Float)                     # Line drive % (lower = better)
+
+    # Metadata
+    pa_against = Column(Integer)                # Plate appearances faced
+    ip = Column(Float)                          # Innings pitched (for min threshold)
+
+    # Arsenal summary (computed from pitch-level data)
+    arsenal_depth_score = Column(Float)         # Count of pitches w/ usage>10% AND RV<0
+    fastball_velocity = Column(Float)           # Avg speed of primary fastball (FF/SI)
+    best_secondary_rv = Column(Float)           # Best (lowest) RV/100 among non-FB pitches
+
+    __table_args__ = (
+        UniqueConstraint("player_id", "season", name="uq_pitcher_statcast_player_season"),
+        Index("idx_pitcher_statcast_season", "season"),
+    )
+
+    def __repr__(self):
+        return f"<PitcherStatcast {self.player_id} {self.season}: xERA={self.xera}>"
+
+
+class PitcherPitchMetrics(Base):
+    """
+    Per-pitch-type, per-season metrics for each pitcher.
+    One row per pitcher per season per pitch type.
+    Tracks run value, velocity, whiff rate, and usage for each pitch.
+
+    This is where we identify:
+    - Declining fastball velocity (regression signal)
+    - New plus secondary pitches (breakout catalyst)
+    - Arsenal diversity / predictability risk
+    """
+    __tablename__ = "pitcher_pitch_metrics"
+
+    id = Column(Integer, primary_key=True)
+    player_id = Column(Integer, ForeignKey("players.id"), nullable=False)
+    season = Column(Integer, nullable=False)
+    pitch_type = Column(String(5), nullable=False)   # FF, SI, SL, CH, CU, ST, etc.
+    pitch_name = Column(String(30))                   # "4-Seam Fastball", "Slider", etc.
+
+    # Per-pitch performance
+    run_value_per_100 = Column(Float)                 # Run value per 100 pitches (+ = good)
+    run_value = Column(Float)                         # Total run value
+    pitches_thrown = Column(Integer)                   # Total pitches of this type
+    usage_pct = Column(Float)                         # Usage percentage
+
+    # Per-pitch outcomes
+    whiff_rate = Column(Float)                        # Whiff % on this pitch
+    chase_rate = Column(Float)                        # Chase % when thrown outside zone
+    ba_against = Column(Float)                        # BA when put in play
+    slg_against = Column(Float)                       # SLG when put in play
+    woba_against = Column(Float)                      # wOBA against this pitch
+    hard_hit_pct = Column(Float)                      # Hard hit % against this pitch
+
+    # Physical properties
+    avg_speed = Column(Float)                         # Average velocity (mph)
+    avg_spin = Column(Float)                          # Average spin rate (rpm)
+    induced_vertical_break = Column(Float)            # IVB in inches (higher = more rise)
+    xwoba_against = Column(Float)                     # Expected wOBA against this pitch
+
+    __table_args__ = (
+        UniqueConstraint("player_id", "season", "pitch_type",
+                         name="uq_pitch_metrics_player_season_type"),
+        Index("idx_pitch_metrics_season", "season"),
+    )
+
+    def __repr__(self):
+        return f"<PitchMetric {self.player_id} {self.season} {self.pitch_type}: RV={self.run_value_per_100}>"
+
+
+# ═══════════════════════════════════════════════════════════
+# ROSTER TRACKING
+# ═══════════════════════════════════════════════════════════
+
+class RosterSnapshot(Base):
+    """
+    Daily snapshot of a player's roster status.
+    One row per player per date. Tracks roster moves over time:
+    trades, DFA, IL stints, call-ups, etc.
+    """
+    __tablename__ = "roster_snapshots"
+
+    id = Column(Integer, primary_key=True)
+    player_id = Column(Integer, ForeignKey("players.id"), nullable=False)
+    team_id = Column(Integer, ForeignKey("teams.id"), nullable=False)
+    date = Column(Date, nullable=False)
+    status = Column(String(20), nullable=False)   # active, IL10, IL60, minors, DFA
+    roster_type = Column(String(20))               # 40Man, active
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    __table_args__ = (
+        UniqueConstraint("player_id", "date", name="uq_roster_player_date"),
+        Index("idx_roster_date", "date"),
+        Index("idx_roster_team_date", "team_id", "date"),
+    )
+
+    def __repr__(self):
+        return f"<RosterSnapshot player={self.player_id} team={self.team_id} {self.date} {self.status}>"
+
+
+# ═══════════════════════════════════════════════════════════
 # AGGREGATION & MODEL TABLES
 # ═══════════════════════════════════════════════════════════
 
