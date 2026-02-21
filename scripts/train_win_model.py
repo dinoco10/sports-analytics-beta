@@ -59,6 +59,61 @@ except ImportError:
 FEATURES_PATH = Path(__file__).parent.parent / "data" / "features" / "game_features.csv"
 MODELS_DIR = Path(__file__).parent.parent / "models"
 
+# ===================================================================
+# PRUNED FEATURE SET — top 40 by LightGBM split importance
+# ===================================================================
+# Started at 82 features, pruned to 35 (PR #15), then added 5 handedness
+# features (Layer 6) for a total of 40. Log loss: 0.6729 → 0.6649 (-80bp).
+
+PRUNED_FEATURES = [
+    # Projections (strongest signal)
+    "away_proj_lineup_woba",
+    "diff_proj_sp_k_bb",
+    "diff_proj_sp_sc_era",
+    "diff_proj_lineup_woba",
+    "home_proj_lineup_woba",
+    "home_proj_lineup_bb_score",
+    "away_proj_sp_k_bb",
+    "home_proj_sp_sc_era",
+    "home_proj_sp_fip",
+    "diff_proj_sp_sust",
+    "home_proj_sp_war",
+    # Team rolling
+    "diff_pyth_t30",
+    "diff_pyth_t14",
+    "away_team_whip_t14",
+    "home_team_whip_t30",
+    "away_team_k_pct_t14",
+    "home_team_k_pct_t14",
+    # Starting pitcher rolling
+    "home_era_sp10",
+    "away_k_pct_sp10",
+    "away_bb_pct_sp10",
+    "away_ip_per_start_sp10",
+    "home_fip_sp10",
+    "home_bb_pct_sp10",
+    "away_era_sp5",
+    "away_fip_sp10",
+    "home_ip_per_start_sp5",
+    "away_whip_sp10",
+    "away_era_sp10",
+    "away_k_pct_sp5",
+    "home_ip_per_start_sp10",
+    # Bullpen diffs
+    "diff_bp_bb_pct_bp35",
+    "diff_bp_whip_bp35",
+    "diff_bp_k_pct_bp35",
+    # Lineup
+    "home_lineup_slg",
+    "away_lineup_slg",
+    # Handedness matchups (Layer 6 — ~80bp improvement)
+    "home_platoon_adv",
+    "away_platoon_adv",
+    # Arsenal x handedness interactions
+    "away_velo_x_same_hand",
+    "home_velo_x_same_hand",
+    "home_ivb_x_same_hand",
+]
 
 def get_feature_layers():
     """
@@ -93,6 +148,13 @@ def get_feature_layers():
             "patterns": ["proj_sp_war", "proj_sp_fip", "proj_sp_sc_era",
                          "proj_sp_sust", "proj_sp_breakout", "proj_sp_k_bb",
                          "proj_lineup_woba", "proj_lineup_bb_score"],
+        },
+        6: {
+            "name": "+ Rest/Handedness",
+            "description": "Rest days, platoon advantage, arsenal x handedness interactions",
+            "patterns": ["rest_days", "platoon_adv",
+                         "sp_same_hand_pct",
+                         "velo_x_same_hand", "ivb_x_same_hand"],
         },
     }
     return layers
@@ -264,7 +326,7 @@ def shap_analysis(model, X_test, feature_names, top_n=15):
 
 def main():
     parser = argparse.ArgumentParser(description="Train win probability model")
-    parser.add_argument("--layer", type=int, default=5, help="Max feature layer (1-5)")
+    parser.add_argument("--layer", type=int, default=6, help="Max feature layer (1-6)")
     parser.add_argument("--test-season", type=int, default=2025, help="Test season")
     parser.add_argument("--all-layers", action="store_true", help="Train each layer incrementally")
     parser.add_argument("--max-depth", type=int, default=2, help="Tree max depth")

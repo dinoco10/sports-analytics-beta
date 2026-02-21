@@ -592,6 +592,160 @@ def compute_lineup_features(hitting_df, games_df, player_positions, window=BATTE
 
 
 # ═══════════════════════════════════════════════════════════════
+# LAYER 6a: REST DAYS (computed from game dates)
+# ═══════════════════════════════════════════════════════════════
+#
+# games.home_rest_days / away_rest_days are always NULL in the DB,
+# so we compute them here from the actual game schedule.
+# For each team, rest_days = (game_date - previous_game_date).days - 1
+# Doubleheaders (same date) = 0 rest.  Season openers = NaN (median fill).
+# Clipped to [0, 7] to cap long breaks (ASB, postponements).
+
+def compute_rest_days(games_df):
+    """
+    Compute rest days for each team in each game from the schedule.
+
+    Strategy:
+    1. Explode games into 2 rows per game (one for each team)
+    2. Sort by (team_id, season, date) chronologically
+    3. Compute days between consecutive games per team per season
+    4. Pivot back to game-level (home_rest_days, away_rest_days, diff)
+    """
+    # Build team schedule: 2 rows per game
+    rows = []
+    for _, game in games_df.iterrows():
+        for side in ["home", "away"]:
+            rows.append({
+                "game_id": game["game_id"],
+                "date": game["date"],
+                "season": game["season"],
+                "team_id": game[f"{side}_team_id"],
+                "side": side,
+            })
+
+    schedule = pd.DataFrame(rows)
+    schedule = schedule.sort_values(["team_id", "season", "date", "game_id"])
+
+    # Compute rest days per team per season
+    schedule["prev_date"] = schedule.groupby(["team_id", "season"])["date"].shift(1)
+    schedule["rest_days"] = (schedule["date"] - schedule["prev_date"]).dt.days - 1
+
+    # Season openers have no prev_date → NaN (will be median-filled later)
+    # Doubleheaders: same date → -1 days, clip to 0
+    schedule["rest_days"] = schedule["rest_days"].clip(lower=0, upper=7)
+
+    # Pivot back to game-level
+    home_rest = schedule[schedule["side"] == "home"][["game_id", "rest_days"]].rename(
+        columns={"rest_days": "home_rest_days"}
+    )
+    away_rest = schedule[schedule["side"] == "away"][["game_id", "rest_days"]].rename(
+        columns={"rest_days": "away_rest_days"}
+    )
+
+    result = home_rest.merge(away_rest, on="game_id", how="outer")
+    result["diff_rest_days"] = result["home_rest_days"] - result["away_rest_days"]
+
+    n_computed = result["home_rest_days"].notna().sum()
+    print(f"  Computed rest days for {n_computed}/{len(result)} games "
+          f"(season openers = NaN, median-filled later)")
+
+    return result
+
+
+# ═══════════════════════════════════════════════════════════════
+# LAYER 6b: HANDEDNESS MATCHUPS (platoon advantage)
+# ═══════════════════════════════════════════════════════════════
+#
+# Platoon advantage: batters who have the "opposite hand" vs the SP.
+# SP throws R → LHB and Switch hitters have advantage.
+# SP throws L → RHB and Switch hitters have advantage.
+# Output is a 0.0-1.0 scale = fraction of lineup with platoon advantage.
+
+def compute_handedness_features(games_df, hitting_df, conn):
+    """
+    For each game, compute what fraction of each team's lineup
+    has platoon advantage against the opposing starting pitcher.
+
+    Platoon advantage rules:
+    - SP throws R → advantage for L and S batters
+    - SP throws L → advantage for R and S batters
+    - SP throws unknown → default 0.50
+    """
+    # Load player bats/throws from DB
+    player_info = pd.read_sql(
+        "SELECT id, bats, throws FROM players", conn
+    )
+    bats_map = dict(zip(player_info["id"], player_info["bats"]))    # player_id → 'R'/'L'/'S'/None
+    throws_map = dict(zip(player_info["id"], player_info["throws"]))  # player_id → 'R'/'L'/None
+
+    # Build game_id → {side: [player_ids]} from hitting_df
+    game_lineups = {}
+    for _, row in hitting_df.iterrows():
+        gid = row["game_id"]
+        tid = row["team_id"]
+        pid = row["player_id"]
+        if gid not in game_lineups:
+            game_lineups[gid] = {}
+        if tid not in game_lineups[gid]:
+            game_lineups[gid][tid] = []
+        game_lineups[gid][tid].append(pid)
+
+    results = []
+    for _, game in games_df.iterrows():
+        game_id = game["game_id"]
+        row = {"game_id": game_id}
+
+        for side, opp_side in [("home", "away"), ("away", "home")]:
+            team_id = game[f"{side}_team_id"]
+            opp_starter_id = game.get(f"{opp_side}_starter_id")
+
+            # Get opposing SP's throwing hand
+            sp_throws = None
+            if pd.notna(opp_starter_id):
+                sp_throws = throws_map.get(int(opp_starter_id))
+
+            if sp_throws is None:
+                # Unknown SP hand → default 0.50
+                row[f"{side}_platoon_adv"] = 0.50
+                continue
+
+            # Count hitters with platoon advantage
+            hitter_pids = game_lineups.get(game_id, {}).get(team_id, [])
+
+            if not hitter_pids:
+                row[f"{side}_platoon_adv"] = 0.50
+                continue
+
+            adv_count = 0
+            total_count = 0
+            for pid in hitter_pids:
+                bat_hand = bats_map.get(pid)
+                if bat_hand is None:
+                    continue
+                total_count += 1
+                # Switch hitters always have advantage
+                if bat_hand == "S":
+                    adv_count += 1
+                # LHB vs RHP or RHB vs LHP
+                elif (sp_throws == "R" and bat_hand == "L") or \
+                     (sp_throws == "L" and bat_hand == "R"):
+                    adv_count += 1
+
+            row[f"{side}_platoon_adv"] = adv_count / total_count if total_count > 0 else 0.50
+
+        row["diff_platoon_adv"] = row.get("home_platoon_adv", 0.5) - row.get("away_platoon_adv", 0.5)
+        results.append(row)
+
+    result_df = pd.DataFrame(results)
+
+    avg_adv = result_df["home_platoon_adv"].mean()
+    print(f"  Computed platoon advantage for {len(result_df)} games "
+          f"(avg home platoon adv: {avg_adv:.3f})")
+
+    return result_df
+
+
+# ═══════════════════════════════════════════════════════════════
 # LAYER 5: PROJECTION-BASED FEATURES
 # ═══════════════════════════════════════════════════════════════
 #
@@ -745,14 +899,15 @@ def compute_projection_features(games_df, hitting_df, pitcher_map, hitter_map):
 # ═══════════════════════════════════════════════════════════════
 
 def assemble_game_features(games_df, team_features, sp_features, bp_features,
-                           lineup_features=None, projection_features=None):
+                           lineup_features=None, projection_features=None,
+                           rest_days_df=None, handedness_df=None):
     """Merge all feature layers into a single game-level matrix."""
-    
+
     result = games_df[["game_id", "mlb_game_id", "date", "season",
                         "home_team_id", "away_team_id",
                         "home_score", "away_score", "home_win", "total_runs"]].copy()
-    
-    for col in ["day_night", "home_rest_days", "away_rest_days"]:
+
+    for col in ["day_night"]:
         if col in games_df.columns:
             result[col] = games_df[col]
     
@@ -847,6 +1002,45 @@ def assemble_game_features(games_df, team_features, sp_features, bp_features,
             on='game_id', how='left'
         )
 
+    # --- Rest days (Layer 6a) ---
+    if rest_days_df is not None and len(rest_days_df) > 0:
+        result = result.merge(
+            rest_days_df[["game_id", "home_rest_days", "away_rest_days", "diff_rest_days"]],
+            on="game_id", how="left"
+        )
+
+    # --- Handedness matchups (Layer 6b) ---
+    if handedness_df is not None and len(handedness_df) > 0:
+        result = result.merge(
+            handedness_df[["game_id", "home_platoon_adv", "away_platoon_adv", "diff_platoon_adv"]],
+            on="game_id", how="left"
+        )
+
+    # --- Arsenal x Handedness interactions (Layer 6c) ---
+    # sp_same_hand_pct = fraction of lineup that does NOT have platoon advantage
+    # i.e., 1.0 - opposing_platoon_adv (higher = SP faces more same-hand batters)
+    # Interaction: velocity/IVB matter more when SP faces same-hand batters
+    if handedness_df is not None and len(handedness_df) > 0:
+        for side, opp in [("home", "away"), ("away", "home")]:
+            # Same-hand pct for this side's SP = 1 - opposing lineup's platoon adv
+            same_col = f"{side}_sp_same_hand_pct"
+            result[same_col] = 1.0 - result.get(f"{opp}_platoon_adv", 0.5)
+
+            velo_col = f"{side}_proj_sp_velo"
+            ivb_col = f"{side}_proj_sp_ivb"
+
+            if velo_col in result.columns:
+                result[f"{side}_velo_x_same_hand"] = result[velo_col] * result[same_col]
+            if ivb_col in result.columns:
+                result[f"{side}_ivb_x_same_hand"] = result[ivb_col] * result[same_col]
+
+        # Interaction diffs
+        for feat in ["velo_x_same_hand", "ivb_x_same_hand"]:
+            hc = f"home_{feat}"
+            ac = f"away_{feat}"
+            if hc in result.columns and ac in result.columns:
+                result[f"diff_{feat}"] = result[hc] - result[ac]
+
     # --- Derived difference features ---
     for window in TEAM_WINDOWS:
         sfx = f"_t{window}"
@@ -917,7 +1111,7 @@ def main():
     lineup_features = None
     hitters = None
     if not args.skip_lineup:
-        print("\n[6/8] Computing lineup features...")
+        print("\n[6/10] Computing lineup features...")
         try:
             hitters = load_hitting_stats(conn)
             print(f"  Loaded {len(hitters)} hitter game lines")
@@ -928,11 +1122,11 @@ def main():
         except Exception as e:
             print(f"  Lineup features skipped: {e}")
     else:
-        print("\n[6/8] Skipping lineup features (--skip-lineup)")
+        print("\n[6/10] Skipping lineup features (--skip-lineup)")
 
     # Layer 5: Projection-based features
     projection_features = None
-    print("\n[7/8] Computing projection features (Layer 5)...")
+    print("\n[7/10] Computing projection features (Layer 5)...")
     try:
         pitcher_map, hitter_map = load_projection_maps()
         if pitcher_map and hitter_map:
@@ -947,11 +1141,30 @@ def main():
     except Exception as e:
         print(f"  Projection features skipped: {e}")
 
+    # Layer 6a: Rest days (computed from game dates)
+    rest_days_df = None
+    print("\n[8/10] Computing rest days (Layer 6a)...")
+    try:
+        rest_days_df = compute_rest_days(games)
+    except Exception as e:
+        print(f"  Rest days skipped: {e}")
+
+    # Layer 6b: Handedness matchups (platoon advantage)
+    handedness_df = None
+    print("\n[9/10] Computing handedness features (Layer 6b)...")
+    try:
+        if hitters is None:
+            hitters = load_hitting_stats(conn)
+        handedness_df = compute_handedness_features(games, hitters, conn)
+    except Exception as e:
+        print(f"  Handedness features skipped: {e}")
+
     # ---- Assemble ----
-    print("\n[8/8] Assembling game feature matrix...")
+    print("\n[10/10] Assembling game feature matrix...")
     game_features = assemble_game_features(
         games, team_features, sp_features, bp_features,
-        lineup_features, projection_features
+        lineup_features, projection_features,
+        rest_days_df, handedness_df
     )
     
     if args.season:
