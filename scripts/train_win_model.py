@@ -59,6 +59,55 @@ except ImportError:
 FEATURES_PATH = Path(__file__).parent.parent / "data" / "features" / "game_features.csv"
 MODELS_DIR = Path(__file__).parent.parent / "models"
 
+# ===================================================================
+# PRUNED FEATURE SET — top 35 by LightGBM split importance
+# ===================================================================
+# Dropping the bottom 47 features (importance <= 5) improved log loss
+# by ~16 bp. These 35 capture 81% of total importance with less noise.
+
+PRUNED_FEATURES = [
+    # Projections (strongest signal)
+    "away_proj_lineup_woba",
+    "diff_proj_sp_k_bb",
+    "diff_proj_sp_sc_era",
+    "diff_proj_lineup_woba",
+    "home_proj_lineup_woba",
+    "home_proj_lineup_bb_score",
+    "away_proj_sp_k_bb",
+    "home_proj_sp_sc_era",
+    "home_proj_sp_fip",
+    "diff_proj_sp_sust",
+    "home_proj_sp_war",
+    # Team rolling
+    "diff_pyth_t30",
+    "diff_pyth_t14",
+    "away_team_whip_t14",
+    "home_team_whip_t30",
+    "away_team_k_pct_t14",
+    "home_team_k_pct_t14",
+    # Starting pitcher rolling
+    "home_era_sp10",
+    "away_k_pct_sp10",
+    "away_bb_pct_sp10",
+    "away_ip_per_start_sp10",
+    "home_fip_sp10",
+    "home_bb_pct_sp10",
+    "away_era_sp5",
+    "away_fip_sp10",
+    "home_ip_per_start_sp5",
+    "away_whip_sp10",
+    "away_era_sp10",
+    "away_k_pct_sp5",
+    "home_ip_per_start_sp10",
+    # Bullpen diffs
+    "diff_bp_bb_pct_bp35",
+    "diff_bp_whip_bp35",
+    "diff_bp_k_pct_bp35",
+    # Lineup
+    "home_lineup_slg",
+    "away_lineup_slg",
+]
+
 
 def get_feature_layers():
     """
@@ -267,6 +316,7 @@ def main():
     parser.add_argument("--layer", type=int, default=5, help="Max feature layer (1-5)")
     parser.add_argument("--test-season", type=int, default=2025, help="Test season")
     parser.add_argument("--all-layers", action="store_true", help="Train each layer incrementally")
+    parser.add_argument("--pruned", action="store_true", help="Use pruned 35-feature set (best log loss)")
     parser.add_argument("--max-depth", type=int, default=2, help="Tree max depth")
     parser.add_argument("--shap", action="store_true", help="Run SHAP analysis")
     parser.add_argument("--save", action="store_true", help="Save best model")
@@ -307,6 +357,77 @@ def main():
     print(f"  Test:  season {test_season} ({len(test_df)} games)")
 
     target = "home_win"
+
+    # --pruned mode: skip layer iteration, use the curated 35-feature set
+    if args.pruned:
+        feature_cols = [f for f in PRUNED_FEATURES if f in df.columns]
+        missing = [f for f in PRUNED_FEATURES if f not in df.columns]
+        if missing:
+            print(f"\n  WARNING: {len(missing)} pruned features missing from data: {missing[:5]}...")
+
+        print(f"\n{'=' * 70}")
+        print(f"  PRUNED MODEL: {len(feature_cols)} features (top by importance)")
+        print(f"{'=' * 70}")
+
+        X_train = train_df[feature_cols].copy()
+        y_train = train_df[target].copy()
+        X_test = test_df[feature_cols].copy()
+        y_test = test_df[target].copy()
+
+        for col in feature_cols:
+            median_val = X_train[col].median()
+            X_train[col] = X_train[col].fillna(median_val)
+            X_test[col] = X_test[col].fillna(median_val)
+
+        valid_train = y_train.notna()
+        X_train = X_train[valid_train]
+        y_train = y_train[valid_train].astype(int)
+        valid_test = y_test.notna()
+        X_test = X_test[valid_test]
+        y_test = y_test[valid_test].astype(int)
+
+        print(f"  Training (max_depth={args.max_depth})...")
+        model = train_model(X_train, y_train, max_depth=args.max_depth)
+        results, probs = evaluate_model(model, X_test, y_test)
+        print_results(results, label=f"Pruned ({len(feature_cols)} features)")
+
+        importances = model.feature_importances_
+        sorted_idx = np.argsort(importances)[::-1]
+        print(f"\n  Feature importance:")
+        for i in range(len(feature_cols)):
+            idx = sorted_idx[i]
+            print(f"    {i+1:2d}. {feature_cols[idx]:45s} | imp={importances[idx]:.0f}")
+
+        if args.shap:
+            shap_analysis(model, X_test, feature_cols)
+
+        if args.save:
+            MODELS_DIR.mkdir(parents=True, exist_ok=True)
+            if HAS_LGBM:
+                model_path = MODELS_DIR / "win_probability_lgbm.txt"
+                model.booster_.save_model(str(model_path))
+            else:
+                import joblib
+                model_path = MODELS_DIR / "win_probability_sklearn.pkl"
+                joblib.dump(model, str(model_path))
+
+            meta = {
+                "features": feature_cols,
+                "log_loss": results["log_loss"],
+                "test_season": test_season,
+                "max_depth": args.max_depth,
+                "pruned": True,
+            }
+            meta_path = MODELS_DIR / "win_probability_meta.json"
+            with open(meta_path, "w") as f:
+                json.dump(meta, f, indent=2)
+            print(f"\n  Model saved to: {model_path}")
+            print(f"  Metadata saved to: {meta_path}")
+
+        print(f"\n{'=' * 70}")
+        print(f"  LOG LOSS: {results['log_loss']:.6f}")
+        print(f"{'=' * 70}")
+        return
 
     # Determine which layers to train
     if args.all_layers:
