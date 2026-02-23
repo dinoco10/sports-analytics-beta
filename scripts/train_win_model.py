@@ -165,7 +165,8 @@ def get_feature_layers():
                          "sp_same_hand_pct",
                          "velo_x_same_hand", "ivb_x_same_hand",
                          "venue_wpct", "venue_rs", "venue_ra",
-                         "elo"],
+                         "elo",
+                         "bp_ip_last", "bp_pitches_last", "bp_fatigue_last"],
         },
     }
     return layers

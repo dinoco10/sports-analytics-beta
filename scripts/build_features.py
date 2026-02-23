@@ -481,6 +481,104 @@ def compute_bullpen_rolling(pitching_df, games_df, windows=BP_WINDOWS):
 
 
 # ═══════════════════════════════════════════════════════════════
+# LAYER 3b: BULLPEN AVAILABILITY (fatigue / workload)
+# ═══════════════════════════════════════════════════════════════
+
+def compute_bullpen_availability(pitching_df, games_df):
+    """
+    Compute bullpen workload/availability features.
+
+    For each team before each game, compute:
+    - bp_ip_last1/2/3: total reliever IP in last 1/2/3 team games
+    - bp_pitches_last1/2/3: total reliever pitches in last 1/2/3 team games
+    - bp_high_lev_unavail: number of top relievers (by IP) who pitched back-to-back
+
+    These capture whether a team's bullpen is fresh or gassed —
+    information that no projection or rolling average captures.
+    """
+    # Identify relievers: anyone who pitched but wasn't the starter
+    relievers = pitching_df[~pitching_df["is_starter"]].copy()
+    if relievers.empty:
+        return pd.DataFrame()
+
+    # Aggregate reliever workload per team per game
+    bp_game = (
+        relievers.groupby(["game_id", "team_id"])
+        .agg(
+            bp_ip=("ip_decimal", "sum"),
+            bp_pitches=("pitches", "sum"),
+            n_relievers=("player_id", "nunique"),
+        )
+        .reset_index()
+    )
+
+    # Merge dates
+    bp_game = bp_game.merge(
+        games_df[["game_id", "date", "season"]],
+        on="game_id", how="left"
+    )
+    bp_game = bp_game.sort_values(["team_id", "date", "game_id"])
+
+    # Compute rolling workload over last 1/2/3 games (shift(1) = pre-game)
+    results = []
+    for team_id, group in bp_game.groupby("team_id"):
+        group = group.copy()
+
+        for window in [1, 2, 3]:
+            group[f"bp_ip_last{window}"] = (
+                group["bp_ip"].shift(1).rolling(window, min_periods=1).sum()
+            )
+            group[f"bp_pitches_last{window}"] = (
+                group["bp_pitches"].shift(1).rolling(window, min_periods=1).sum()
+            )
+            group[f"bp_relievers_last{window}"] = (
+                group["n_relievers"].shift(1).rolling(window, min_periods=1).sum()
+            )
+
+        results.append(group)
+
+    bp_avail = pd.concat(results, ignore_index=True)
+
+    # Now build game-level features (home and away)
+    game_results = []
+    for _, game in games_df.iterrows():
+        game_id = game["game_id"]
+        row = {"game_id": game_id}
+
+        for side in ["home", "away"]:
+            team_id = game[f"{side}_team_id"]
+            team_bp = bp_avail[
+                (bp_avail["game_id"] == game_id) & (bp_avail["team_id"] == team_id)
+            ]
+
+            if len(team_bp) > 0:
+                t = team_bp.iloc[0]
+                for window in [1, 2, 3]:
+                    row[f"{side}_bp_ip_last{window}"] = t.get(f"bp_ip_last{window}", np.nan)
+                    row[f"{side}_bp_pitches_last{window}"] = t.get(f"bp_pitches_last{window}", np.nan)
+            else:
+                for window in [1, 2, 3]:
+                    row[f"{side}_bp_ip_last{window}"] = np.nan
+                    row[f"{side}_bp_pitches_last{window}"] = np.nan
+
+        # Diff features (higher = home bullpen more fatigued)
+        for window in [1, 2, 3]:
+            h_ip = row.get(f"home_bp_ip_last{window}", 0) or 0
+            a_ip = row.get(f"away_bp_ip_last{window}", 0) or 0
+            row[f"diff_bp_fatigue_last{window}"] = h_ip - a_ip
+
+        game_results.append(row)
+
+    result_df = pd.DataFrame(game_results)
+
+    # Stats
+    non_null = result_df["home_bp_ip_last1"].notna().sum()
+    print(f"  Bullpen availability for {non_null}/{len(result_df)} games")
+
+    return result_df
+
+
+# ═══════════════════════════════════════════════════════════════
 # LAYER 4: LINEUP FEATURES (avg OBP + SLG of hitters that game)
 # ═══════════════════════════════════════════════════════════════
 
@@ -1217,7 +1315,7 @@ def assemble_game_features(games_df, team_features, sp_features, bp_features,
                            lineup_features=None, projection_features=None,
                            rest_days_df=None, handedness_df=None,
                            venue_splits_df=None, team_proj_features=None,
-                           elo_df=None):
+                           elo_df=None, bp_avail_features=None):
     """Merge all feature layers into a single game-level matrix."""
 
     result = games_df[["game_id", "mlb_game_id", "date", "season",
@@ -1334,6 +1432,14 @@ def assemble_game_features(games_df, team_features, sp_features, bp_features,
             on="game_id", how="left"
         )
 
+    # --- Bullpen availability ---
+    if bp_avail_features is not None and len(bp_avail_features) > 0:
+        bp_cols = [c for c in bp_avail_features.columns if c != 'game_id']
+        result = result.merge(
+            bp_avail_features[['game_id'] + bp_cols],
+            on='game_id', how='left'
+        )
+
     # --- Rest days (Layer 6a) ---
     if rest_days_df is not None and len(rest_days_df) > 0:
         result = result.merge(
@@ -1447,7 +1553,17 @@ def main():
     print("\n[5/7] Computing bullpen rolling stats...")
     bp_features = compute_bullpen_rolling(pitchers, games, windows=BP_WINDOWS)
     print(f"  Generated {len(bp_features)} bullpen feature rows")
-    
+
+    # Layer 3b: Bullpen availability/fatigue
+    bp_avail_features = None
+    print("\n[5b/14] Computing bullpen availability (fatigue)...")
+    try:
+        bp_avail_features = compute_bullpen_availability(pitchers, games)
+        if bp_avail_features is not None and len(bp_avail_features) > 0:
+            print(f"  Generated {len(bp_avail_features)} bullpen availability rows")
+    except Exception as e:
+        print(f"  Bullpen availability skipped: {e}")
+
     lineup_features = None
     hitters = None
     if not args.skip_lineup:
@@ -1533,7 +1649,7 @@ def main():
         games, team_features, sp_features, bp_features,
         lineup_features, projection_features,
         rest_days_df, handedness_df, venue_splits_df,
-        team_proj_features, elo_df
+        team_proj_features, elo_df, bp_avail_features
     )
     
     if args.season:
