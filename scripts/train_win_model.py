@@ -443,8 +443,15 @@ def main():
             meta_path = MODELS_DIR / "win_probability_meta.json"
             with open(meta_path, "w") as f:
                 json.dump(meta, f, indent=2)
+            # Save feature medians for NaN imputation in live pipeline
+            medians = {col: float(X_train[col].median()) for col in feature_cols}
+            medians_path = MODELS_DIR / "feature_medians.json"
+            with open(medians_path, "w") as f:
+                json.dump(medians, f, indent=2)
+
             print(f"\n  Model saved to: {model_path}")
             print(f"  Metadata saved to: {meta_path}")
+            print(f"  Medians saved to: {medians_path}")
 
         print(f"\n{'=' * 70}")
         print(f"  LOG LOSS: {results['log_loss']:.6f}")
@@ -561,8 +568,16 @@ def main():
         with open(meta_path, "w") as f:
             json.dump(meta, f, indent=2)
 
+        # Save feature medians for NaN imputation in live pipeline
+        X_train_best = train_df[best_features].copy()
+        medians = {col: float(X_train_best[col].median()) for col in best_features}
+        medians_path = MODELS_DIR / "feature_medians.json"
+        with open(medians_path, "w") as f:
+            json.dump(medians, f, indent=2)
+
         print(f"\n  Model saved to: {model_path}")
         print(f"  Metadata saved to: {meta_path}")
+        print(f"  Medians saved to: {medians_path}")
 
     # Summary table
     if len(all_results) > 1:
