@@ -64,7 +64,8 @@ MODELS_DIR = Path(__file__).parent.parent / "models"
 # ===================================================================
 # Started at 82 features, pruned to 35 (PR #15), then added 5 handedness
 # features + 3 venue split features for a total of 43.
-# Log loss: 0.6729 → 0.6633 (-96bp).
+# Log loss: 0.6694 (honest, no lookahead — per-season Marcel snapshots).
+# Previous 0.6635 was inflated by using 2026 projections on all games.
 
 PRUNED_FEATURES = [
     # Projections (strongest signal)
@@ -337,6 +338,7 @@ def main():
     parser.add_argument("--all-layers", action="store_true", help="Train each layer incrementally")
     parser.add_argument("--pruned", action="store_true", help="Use pruned feature set (best log loss)")
     parser.add_argument("--max-depth", type=int, default=2, help="Tree max depth")
+    parser.add_argument("--train-start", type=int, default=2021, help="First training season (default 2021, skips COVID 2020)")
     parser.add_argument("--shap", action="store_true", help="Run SHAP analysis")
     parser.add_argument("--save", action="store_true", help="Save best model")
     args = parser.parse_args()
@@ -356,9 +358,10 @@ def main():
     df["date"] = pd.to_datetime(df["date"])
     print(f"  Loaded {len(df)} games, seasons: {sorted(df['season'].unique())}")
 
-    # Time-based split
+    # Time-based split (skip COVID 2020 by default)
     test_season = args.test_season
-    train_seasons = [s for s in df["season"].unique() if s < test_season]
+    train_start = args.train_start
+    train_seasons = [s for s in df["season"].unique() if train_start <= s < test_season]
 
     if not train_seasons:
         print(f"\nNo training data before season {test_season}!")

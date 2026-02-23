@@ -44,7 +44,7 @@
     "away_venue_wpct",
     "diff_venue_wpct"
   ],
-  "log_loss": 0.6635080146462236,
+  "log_loss": 0.6694471701083423,
   "test_season": 2025,
   "max_depth": 2,
   "pruned": true

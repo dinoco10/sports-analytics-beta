@@ -846,59 +846,84 @@ def compute_handedness_features(games_df, hitting_df, conn):
 
 def load_projection_maps():
     """
-    Load pitcher and hitter projections from CSV into lookup dicts.
+    Load Marcel projection snapshots for each season into lookup dicts.
+
+    Uses frozen snapshots from data/features/snapshots/ to prevent lookahead
+    bias: 2023 games get 2023 projections (built from 2021-2022 data only),
+    2024 games get 2024 projections, etc.
+
+    Falls back to the production 2026 CSVs for any season without a snapshot.
+
     Returns:
-        pitcher_map: mlb_player_id -> {proj_war, proj_fip, proj_era}
-        hitter_map:  mlb_player_id -> {statcast_adjusted_woba, wrc_plus,
-                                        bounce_back_score, proj_war}
+        pitcher_maps: {season: {mlb_player_id: {...}}}
+        hitter_maps:  {season: {mlb_player_id: {...}}}
     """
-    proj_dir = OUTPUT_DIR  # data/features/
+    snapshot_dir = OUTPUT_DIR / "snapshots"
+    proj_dir = OUTPUT_DIR
 
-    pitcher_map = {}
-    hitter_map = {}
+    pitcher_maps = {}
+    hitter_maps = {}
 
-    pitcher_path = proj_dir / "pitcher_projections_2026.csv"
-    if pitcher_path.exists():
-        p_df = pd.read_csv(pitcher_path)
-        for _, row in p_df.iterrows():
-            pitcher_map[row['mlb_player_id']] = {
-                'proj_war': row.get('proj_war', 0),
-                'proj_fip': row.get('proj_fip', 4.20),
-                'proj_era': row.get('proj_era', 4.20),
-                'statcast_adjusted_era': row.get('statcast_adjusted_era', row.get('proj_era', 4.20)),
-                'sustainability_score': row.get('sustainability_score', 50),
-                'breakout_score': row.get('breakout_score', 50),
-                'proj_k_bb_pct': row.get('proj_k_bb_pct', 10.0),
-                'proj_arsenal_depth': row.get('proj_arsenal_depth', 1.5),
-                'proj_fb_velocity': row.get('proj_fb_velocity', 93.9),
-                'proj_fb_ivb': row.get('proj_fb_ivb', 12.8),
-            }
-        print(f"    Loaded {len(pitcher_map)} pitcher projections")
-    else:
-        print(f"    WARNING: {pitcher_path} not found. Run player_projections first.")
+    # Snapshot seasons: each game year maps to its projection year
+    # Games in 2023 use the 2023 Marcel snapshot (built from 2021-2022 data)
+    snapshot_years = [2023, 2024, 2025, 2026]
 
-    hitter_path = proj_dir / "hitter_projections_2026.csv"
-    if hitter_path.exists():
-        h_df = pd.read_csv(hitter_path)
-        for _, row in h_df.iterrows():
-            hitter_map[row['mlb_player_id']] = {
-                'sc_woba': row.get('statcast_adjusted_woba', 0.310),
-                'wrc_plus': row.get('wrc_plus', 100),
-                'bounce_back': row.get('bounce_back_score', 50),
-                'proj_war': row.get('proj_war', 0),
-            }
-        print(f"    Loaded {len(hitter_map)} hitter projections")
-    else:
-        print(f"    WARNING: {hitter_path} not found. Run player_projections first.")
+    for year in snapshot_years:
+        pitcher_map = {}
+        hitter_map = {}
 
-    return pitcher_map, hitter_map
+        # Try snapshot first, fall back to production CSVs for 2026
+        p_path = snapshot_dir / f"marcel_pitchers_{year}.csv"
+        if not p_path.exists() and year == 2026:
+            p_path = proj_dir / "pitcher_projections_2026.csv"
+        h_path = snapshot_dir / f"marcel_hitters_{year}.csv"
+        if not h_path.exists() and year == 2026:
+            h_path = proj_dir / "hitter_projections_2026.csv"
+
+        if p_path.exists():
+            p_df = pd.read_csv(p_path)
+            for _, row in p_df.iterrows():
+                pitcher_map[row['mlb_player_id']] = {
+                    'proj_war': row.get('proj_war', 0),
+                    'proj_fip': row.get('proj_fip', 4.20),
+                    'proj_era': row.get('proj_era', 4.20),
+                    'statcast_adjusted_era': row.get('statcast_adjusted_era',
+                                                     row.get('proj_era', 4.20)),
+                    'sustainability_score': row.get('sustainability_score', 50),
+                    'breakout_score': row.get('breakout_score', 50),
+                    'proj_k_bb_pct': row.get('proj_k_bb_pct',
+                                             row.get('proj_k_pct', 20) - row.get('proj_bb_pct', 10)
+                                             if 'proj_k_pct' in row.index else 10.0),
+                    'proj_arsenal_depth': row.get('proj_arsenal_depth', 1.5),
+                    'proj_fb_velocity': row.get('proj_fb_velocity', 93.9),
+                    'proj_fb_ivb': row.get('proj_fb_ivb', 12.8),
+                }
+
+        if h_path.exists():
+            h_df = pd.read_csv(h_path)
+            for _, row in h_df.iterrows():
+                hitter_map[row['mlb_player_id']] = {
+                    'sc_woba': row.get('statcast_adjusted_woba', 0.310),
+                    'wrc_plus': row.get('wrc_plus', 100),
+                    'bounce_back': row.get('bounce_back_score', 50),
+                    'proj_war': row.get('proj_war', 0),
+                }
+
+        pitcher_maps[year] = pitcher_map
+        hitter_maps[year] = hitter_map
+        print(f"    {year} snapshot: {len(pitcher_map)} pitchers, {len(hitter_map)} hitters")
+
+    return pitcher_maps, hitter_maps
 
 
-def compute_projection_features(games_df, hitting_df, pitcher_map, hitter_map):
+def compute_projection_features(games_df, hitting_df, pitcher_maps, hitter_maps):
     """
-    For each game, look up:
+    For each game, look up the correct season's Marcel snapshot and extract:
     1. Starting pitcher's projected fWAR and FIP
     2. Lineup's average statcast_adjusted_woba and bounce-back score
+
+    Uses season-keyed maps to prevent lookahead bias: 2023 games get
+    2023 projections (built from 2021-2022 data), not 2026 projections.
 
     Returns a DataFrame with one row per game, columns:
     - home_proj_sp_war, away_proj_sp_war (starter quality)
@@ -910,7 +935,6 @@ def compute_projection_features(games_df, hitting_df, pitcher_map, hitter_map):
     results = []
 
     # Pre-compute: for each game, which hitters appeared for each team?
-    # Build a game_id -> {team_id: [player_ids]} mapping from hitting_df
     game_hitters = {}
     for _, row in hitting_df.iterrows():
         gid = row['game_id']
@@ -937,7 +961,12 @@ def compute_projection_features(games_df, hitting_df, pitcher_map, hitter_map):
 
     for _, game in games_df.iterrows():
         game_id = game['game_id']
+        game_season = game['season']
         row = {'game_id': game_id}
+
+        # Pick the correct season's snapshot (2023 games → 2023 projections)
+        pitcher_map = pitcher_maps.get(game_season, pitcher_maps.get(2026, {}))
+        hitter_map = hitter_maps.get(game_season, hitter_maps.get(2026, {}))
 
         for side in ['home', 'away']:
             team_id = game[f'{side}_team_id']
@@ -961,7 +990,6 @@ def compute_projection_features(games_df, hitting_df, pitcher_map, hitter_map):
             row[f'{side}_proj_sp_ivb'] = sp_proj['proj_fb_ivb']
 
             # --- Lineup projection ---
-            # Average statcast_adjusted_woba and bounce-back of hitters in this game
             hitter_pids = game_hitters.get(game_id, {}).get(team_id, [])
             wobas = []
             bb_scores = []
@@ -992,6 +1020,86 @@ def compute_projection_features(games_df, hitting_df, pitcher_map, hitter_map):
     return pd.DataFrame(results)
 
 
+def compute_team_projection_features(games_df):
+    """
+    Add team-level projected WAR from Marcel snapshots.
+
+    For each game, looks up the team's total projected hitting WAR,
+    pitching WAR, and combined WAR from the correct season's snapshot.
+    These are static preseason features that don't change game-to-game.
+
+    New features:
+    - home_team_proj_hit_war / away_team_proj_hit_war
+    - home_team_proj_pitch_war / away_team_proj_pitch_war
+    - home_team_proj_war / away_team_proj_war (total)
+    - diff_team_proj_war (home advantage in roster quality)
+    """
+    snapshot_dir = OUTPUT_DIR / "snapshots"
+
+    # Build team WAR lookup per season
+    # Key: (season, team_name) -> {hit_war, pitch_war, total_war}
+    team_war = {}
+    for year in [2023, 2024, 2025, 2026]:
+        h_path = snapshot_dir / f"marcel_hitters_{year}.csv"
+        p_path = snapshot_dir / f"marcel_pitchers_{year}.csv"
+        if not h_path.exists() or not p_path.exists():
+            continue
+
+        h_df = pd.read_csv(h_path)
+        p_df = pd.read_csv(p_path)
+
+        # Filter out free agents and apply WAR floor
+        h_df = h_df[h_df['current_team'] != 'Free Agent'].copy()
+        p_df = p_df[p_df['current_team'] != 'Free Agent'].copy()
+        h_df = h_df[h_df['proj_pa'] >= 100].copy()
+        p_df = p_df[p_df['proj_ip'] >= 30].copy()
+        h_df['proj_war'] = h_df['proj_war'].clip(lower=-1.5)
+        p_df['proj_war'] = p_df['proj_war'].clip(lower=-1.5)
+
+        hit_agg = h_df.groupby('current_team')['proj_war'].sum()
+        pitch_agg = p_df.groupby('current_team')['proj_war'].sum()
+
+        for team_name in set(hit_agg.index) | set(pitch_agg.index):
+            hw = hit_agg.get(team_name, 0)
+            pw = pitch_agg.get(team_name, 0)
+            team_war[(year, team_name)] = {
+                'hit_war': hw, 'pitch_war': pw, 'total_war': hw + pw,
+            }
+
+    # Need team_id -> team_name mapping
+    conn = sqlite3.connect(str(DB_PATH))
+    teams = pd.read_sql("SELECT id, name FROM teams", conn)
+    conn.close()
+    tid_to_name = dict(zip(teams['id'], teams['name']))
+
+    results = []
+    default_war = {'hit_war': 0, 'pitch_war': 0, 'total_war': 0}
+
+    for _, game in games_df.iterrows():
+        game_id = game['game_id']
+        season = game['season']
+        row = {'game_id': game_id}
+
+        for side in ['home', 'away']:
+            team_id = game[f'{side}_team_id']
+            team_name = tid_to_name.get(team_id, '')
+            tw = team_war.get((season, team_name), default_war)
+
+            row[f'{side}_team_proj_hit_war'] = round(tw['hit_war'], 1)
+            row[f'{side}_team_proj_pitch_war'] = round(tw['pitch_war'], 1)
+            row[f'{side}_team_proj_war'] = round(tw['total_war'], 1)
+
+        row['diff_team_proj_war'] = row['home_team_proj_war'] - row['away_team_proj_war']
+        row['diff_team_proj_hit_war'] = row['home_team_proj_hit_war'] - row['away_team_proj_hit_war']
+        row['diff_team_proj_pitch_war'] = row['home_team_proj_pitch_war'] - row['away_team_proj_pitch_war']
+
+        results.append(row)
+
+    print(f"    Team WAR features: {len(results)} games, "
+          f"{len(team_war)} team-season entries")
+    return pd.DataFrame(results)
+
+
 # ═══════════════════════════════════════════════════════════════
 # ASSEMBLY
 # ═══════════════════════════════════════════════════════════════
@@ -999,7 +1107,7 @@ def compute_projection_features(games_df, hitting_df, pitcher_map, hitter_map):
 def assemble_game_features(games_df, team_features, sp_features, bp_features,
                            lineup_features=None, projection_features=None,
                            rest_days_df=None, handedness_df=None,
-                           venue_splits_df=None):
+                           venue_splits_df=None, team_proj_features=None):
     """Merge all feature layers into a single game-level matrix."""
 
     result = games_df[["game_id", "mlb_game_id", "date", "season",
@@ -1098,6 +1206,14 @@ def assemble_game_features(games_df, team_features, sp_features, bp_features,
         proj_cols = [c for c in projection_features.columns if c != 'game_id']
         result = result.merge(
             projection_features[['game_id'] + proj_cols],
+            on='game_id', how='left'
+        )
+
+    # --- Team projection features (Layer 5b) ---
+    if team_proj_features is not None and len(team_proj_features) > 0:
+        tp_cols = [c for c in team_proj_features.columns if c != 'game_id']
+        result = result.merge(
+            team_proj_features[['game_id'] + tp_cols],
             on='game_id', how='left'
         )
 
@@ -1235,22 +1351,34 @@ def main():
     projection_features = None
     print("\n[7/11] Computing projection features (Layer 5)...")
     try:
-        pitcher_map, hitter_map = load_projection_maps()
-        if pitcher_map and hitter_map:
+        pitcher_maps, hitter_maps = load_projection_maps()
+        if any(pitcher_maps.values()) and any(hitter_maps.values()):
             if hitters is None:
                 hitters = load_hitting_stats(conn)
             projection_features = compute_projection_features(
-                games, hitters, pitcher_map, hitter_map
+                games, hitters, pitcher_maps, hitter_maps
             )
             print(f"  Generated {len(projection_features)} projection feature rows")
         else:
-            print("  Skipped — no projection CSVs available")
+            print("  Skipped — no projection snapshots available")
     except Exception as e:
         print(f"  Projection features skipped: {e}")
 
+    # Layer 5b: Team-level projected WAR
+    team_proj_features = None
+    print("\n[8/12] Computing team projection features (Layer 5b)...")
+    try:
+        team_proj_features = compute_team_projection_features(games)
+        if team_proj_features is not None and len(team_proj_features) > 0:
+            print(f"  Generated {len(team_proj_features)} team projection rows")
+        else:
+            print("  Skipped — no team projection data")
+    except Exception as e:
+        print(f"  Team projection features skipped: {e}")
+
     # Layer 6a: Rest days (computed from game dates)
     rest_days_df = None
-    print("\n[8/11] Computing rest days (Layer 6a)...")
+    print("\n[9/12] Computing rest days (Layer 6a)...")
     try:
         rest_days_df = compute_rest_days(games)
     except Exception as e:
@@ -1258,7 +1386,7 @@ def main():
 
     # Layer 6b: Handedness matchups (platoon advantage)
     handedness_df = None
-    print("\n[9/11] Computing handedness features (Layer 6b)...")
+    print("\n[10/12] Computing handedness features (Layer 6b)...")
     try:
         if hitters is None:
             hitters = load_hitting_stats(conn)
@@ -1268,18 +1396,19 @@ def main():
 
     # Layer 6c: Home/away venue splits
     venue_splits_df = None
-    print("\n[10/11] Computing home/away venue splits (Layer 6c)...")
+    print("\n[11/12] Computing home/away venue splits (Layer 6c)...")
     try:
         venue_splits_df = compute_home_away_splits(games)
     except Exception as e:
         print(f"  Venue splits skipped: {e}")
 
     # ---- Assemble ----
-    print("\n[11/11] Assembling game feature matrix...")
+    print("\n[12/12] Assembling game feature matrix...")
     game_features = assemble_game_features(
         games, team_features, sp_features, bp_features,
         lineup_features, projection_features,
-        rest_days_df, handedness_df, venue_splits_df
+        rest_days_df, handedness_df, venue_splits_df,
+        team_proj_features
     )
     
     if args.season:
