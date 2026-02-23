@@ -1050,7 +1050,8 @@ def compute_pitcher_scores(pitcher_statcast, luck_filters, era_adj,
 # ═══════════════════════════════════════════════════════════════
 
 def project_pitcher(player_seasons, pitcher_statcast=None, pitch_metrics=None,
-                    league_avg_era=4.20, league_avg_fip=4.20):
+                    league_avg_era=4.20, league_avg_fip=4.20,
+                    projection_year=2026):
     """
     Marcel-style projection for a single pitcher, now with Statcast overlay.
 
@@ -1071,14 +1072,19 @@ def project_pitcher(player_seasons, pitcher_statcast=None, pitch_metrics=None,
     birth_date = player_seasons.iloc[0]['birth_date']
     role = player_seasons.iloc[-1]['role']  # Most recent role
 
-    # Age in 2026
+    # Age in projection year (parameterized for historical snapshots)
     if pd.notna(birth_date):
-        age_2026 = 2026 - pd.to_datetime(birth_date).year
+        age_2026 = projection_year - pd.to_datetime(birth_date).year
     else:
         age_2026 = 28  # Default assumption
 
-    # Marcel weights
-    year_weights = {2025: 5, 2024: 4, 2023: 3}
+    # Marcel weights — relative to projection year
+    # Most recent season gets 5, one year back gets 4, two years back gets 3
+    year_weights = {
+        projection_year - 1: 5,
+        projection_year - 2: 4,
+        projection_year - 3: 3,
+    }
 
     total_weight = 0
     weighted_era = 0
@@ -1180,10 +1186,12 @@ def project_pitcher(player_seasons, pitcher_statcast=None, pitch_metrics=None,
     # Projected IP — Marcel 5/4/3 weighted average across available years
     # Same logic as hitter PA: prevents a single injured/short season from
     # crushing the projection (e.g., King 65 IP in 2025 → should be ~150).
-    marcel_weights = {2025: 5, 2024: 4, 2023: 3}
+    ip_weights = {
+        projection_year - 1: 5, projection_year - 2: 4, projection_year - 3: 3,
+    }
     weighted_ip_num = 0
     weighted_ip_den = 0
-    for yr, wt in marcel_weights.items():
+    for yr, wt in ip_weights.items():
         yr_ip = player_seasons[player_seasons['season'] == yr]['ip'].sum()
         if yr_ip > 0:
             weighted_ip_num += yr_ip * wt
@@ -1237,7 +1245,8 @@ def project_pitcher(player_seasons, pitcher_statcast=None, pitch_metrics=None,
     }
 
 
-def project_hitter(player_seasons, player_statcast=None, league_avg_woba=None):
+def project_hitter(player_seasons, player_statcast=None, league_avg_woba=None,
+                   projection_year=2026):
     """
     Marcel-style projection for a single hitter, now with Statcast overlay + fWAR.
 
@@ -1261,12 +1270,18 @@ def project_hitter(player_seasons, player_statcast=None, league_avg_woba=None):
     birth_date = player_seasons.iloc[0]['birth_date']
     position = player_seasons.iloc[-1].get('primary_position', 'DH')
 
+    # Age in projection year (parameterized for historical snapshots)
     if pd.notna(birth_date):
-        age_2026 = 2026 - pd.to_datetime(birth_date).year
+        age_2026 = projection_year - pd.to_datetime(birth_date).year
     else:
         age_2026 = 27
 
-    year_weights = {2025: 5, 2024: 4, 2023: 3}
+    # Marcel weights — relative to projection year
+    year_weights = {
+        projection_year - 1: 5,
+        projection_year - 2: 4,
+        projection_year - 3: 3,
+    }
 
     total_weight = 0
     weighted_woba = 0
@@ -1353,10 +1368,12 @@ def project_hitter(player_seasons, player_statcast=None, league_avg_woba=None):
     # Projected PA — Marcel 5/4/3 weighted average across available years
     # Uses the same weighting philosophy as rate stats: recent years matter more,
     # but a single injured season doesn't destroy the projection.
-    marcel_weights = {2025: 5, 2024: 4, 2023: 3}
+    pa_weights = {
+        projection_year - 1: 5, projection_year - 2: 4, projection_year - 3: 3,
+    }
     weighted_pa_num = 0
     weighted_pa_den = 0
-    for yr, wt in marcel_weights.items():
+    for yr, wt in pa_weights.items():
         yr_pa = player_seasons[player_seasons['season'] == yr]['pa'].sum()
         if yr_pa > 0:
             weighted_pa_num += yr_pa * wt
