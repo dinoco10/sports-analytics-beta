@@ -173,32 +173,49 @@ def fit_calibration(records_df: pd.DataFrame, proj_war_series: pd.Series) -> tup
 
 def load_2026_projections() -> pd.DataFrame:
     """
-    Load player projections, filter out free agents, aggregate by team.
+    Load depth chart projections and aggregate by team.
+
+    Uses depth_chart_hitters/pitchers_2026.csv (Layer 2 output) instead of
+    raw Marcel projections. The depth chart module handles:
+      - Free agent filtering
+      - PA/IP allocation by position hierarchy
+      - Team PA/IP caps (5,700 / 1,450)
+      - WAR calculation with depth chart playing time
+      - Per-player WAR floor (-1.5)
+
     Returns: DataFrame with team-level WAR and regression signals.
     """
-    log.info("Loading 2026 player projections...")
+    log.info("Loading 2026 depth chart projections...")
 
-    hitters = pd.read_csv(FEATURES_DIR / "hitter_projections_2026.csv")
-    pitchers = pd.read_csv(FEATURES_DIR / "pitcher_projections_2026.csv")
+    # Load depth chart outputs (Layer 2) — these have depth_pa/depth_ip/depth_war
+    h_path = FEATURES_DIR / "depth_chart_hitters_2026.csv"
+    p_path = FEATURES_DIR / "depth_chart_pitchers_2026.csv"
 
-    # Filter out free agents — only count rostered players
-    hitters = hitters[hitters["current_team"] != "Free Agent"].copy()
-    pitchers = pitchers[pitchers["current_team"] != "Free Agent"].copy()
+    if not h_path.exists() or not p_path.exists():
+        log.warning("  Depth chart CSVs not found — run: python -m src.features.depth_chart")
+        log.warning("  Falling back to raw Marcel projections...")
+        return _load_2026_projections_fallback()
 
-    log.info(f"  Hitters: {len(hitters)} rostered players")
-    log.info(f"  Pitchers: {len(pitchers)} rostered players")
+    hitters = pd.read_csv(h_path)
+    pitchers = pd.read_csv(p_path)
 
-    # Aggregate hitter stats by team
-    hit_agg = hitters.groupby("current_team").agg(
-        hit_war=("proj_war", "sum"),
+    # Only count active players (those assigned playing time by depth chart)
+    active_h = hitters[hitters["depth_pa"] > 0]
+    active_p = pitchers[pitchers["depth_ip"] > 0]
+    log.info(f"  Active hitters:  {len(active_h)} (of {len(hitters)} rostered)")
+    log.info(f"  Active pitchers: {len(active_p)} (of {len(pitchers)} rostered)")
+
+    # Aggregate hitter stats by team — using depth_war (not Marcel's proj_war)
+    hit_agg = active_h.groupby("current_team").agg(
+        hit_war=("depth_war", "sum"),
         avg_bounce_back=("bounce_back_score", "mean"),
         avg_regression_risk_hit=("regression_risk_score", "mean"),
         n_hitters=("mlb_player_id", "count"),
     ).reset_index()
 
     # Aggregate pitcher stats by team
-    pitch_agg = pitchers.groupby("current_team").agg(
-        pitch_war=("proj_war", "sum"),
+    pitch_agg = active_p.groupby("current_team").agg(
+        pitch_war=("depth_war", "sum"),
         avg_sustainability=("sustainability_score", "mean"),
         avg_regression_risk_pitch=("regression_risk_score", "mean"),
         avg_breakout=("breakout_score", "mean"),
@@ -217,6 +234,38 @@ def load_2026_projections() -> pd.DataFrame:
     log.info(f"  WAR range: {team_proj['total_war'].min():.1f} "
              f"to {team_proj['total_war'].max():.1f}")
 
+    return team_proj
+
+
+def _load_2026_projections_fallback() -> pd.DataFrame:
+    """Fallback: load raw Marcel projections if depth chart CSVs don't exist."""
+    hitters = pd.read_csv(FEATURES_DIR / "hitter_projections_2026.csv")
+    pitchers = pd.read_csv(FEATURES_DIR / "pitcher_projections_2026.csv")
+    hitters = hitters[hitters["current_team"] != "Free Agent"].copy()
+    pitchers = pitchers[pitchers["current_team"] != "Free Agent"].copy()
+    hitters = hitters[hitters["proj_pa"] >= 100].copy()
+    pitchers = pitchers[pitchers["proj_ip"] >= 30].copy()
+    hitters["proj_war"] = hitters["proj_war"].clip(lower=-1.5)
+    pitchers["proj_war"] = pitchers["proj_war"].clip(lower=-1.5)
+
+    hit_agg = hitters.groupby("current_team").agg(
+        hit_war=("proj_war", "sum"),
+        avg_bounce_back=("bounce_back_score", "mean"),
+        avg_regression_risk_hit=("regression_risk_score", "mean"),
+        n_hitters=("mlb_player_id", "count"),
+    ).reset_index()
+    pitch_agg = pitchers.groupby("current_team").agg(
+        pitch_war=("proj_war", "sum"),
+        avg_sustainability=("sustainability_score", "mean"),
+        avg_regression_risk_pitch=("regression_risk_score", "mean"),
+        avg_breakout=("breakout_score", "mean"),
+        n_pitchers=("mlb_player_id", "count"),
+    ).reset_index()
+
+    team_proj = hit_agg.merge(pitch_agg, on="current_team", how="outer").fillna(0)
+    team_proj["total_war"] = team_proj["hit_war"] + team_proj["pitch_war"]
+    team_proj = team_proj.rename(columns={"current_team": "team"})
+    log.info(f"  {len(team_proj)} teams (fallback mode)")
     return team_proj
 
 
