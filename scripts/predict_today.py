@@ -53,6 +53,7 @@ from build_features import (
     compute_lineup_features,
     compute_projection_features,
     compute_team_projection_features,
+    compute_elo_ratings,
     compute_rest_days,
     compute_handedness_features,
     compute_home_away_splits,
@@ -323,6 +324,13 @@ def predict_games(target_date, save=False, backtest=False):
         print(f"    Projections skipped: {e}")
         projection_features = None
 
+    print("  Elo ratings...")
+    try:
+        elo_df = compute_elo_ratings(all_games)
+    except Exception as e:
+        print(f"    Elo skipped: {e}")
+        elo_df = None
+
     print("  Team projection features...")
     try:
         team_proj_features = compute_team_projection_features(all_games)
@@ -357,7 +365,7 @@ def predict_games(target_date, save=False, backtest=False):
         all_games, team_features, sp_features, bp_features,
         lineup_features, projection_features,
         rest_days_df, handedness_df, venue_splits_df,
-        team_proj_features,
+        team_proj_features, elo_df,
     )
 
     # Filter to today's games only

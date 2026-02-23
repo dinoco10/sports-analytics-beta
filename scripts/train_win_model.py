@@ -60,12 +60,12 @@ FEATURES_PATH = Path(__file__).parent.parent / "data" / "features" / "game_featu
 MODELS_DIR = Path(__file__).parent.parent / "models"
 
 # ===================================================================
-# PRUNED FEATURE SET — top 43 by LightGBM split importance
+# PRUNED FEATURE SET — top 45 by LightGBM split importance
 # ===================================================================
-# Started at 82 features, pruned to 35 (PR #15), then added 5 handedness
-# features + 3 venue split features for a total of 43.
-# Log loss: 0.6694 (honest, no lookahead — per-season Marcel snapshots).
-# Previous 0.6635 was inflated by using 2026 projections on all games.
+# 43 curated features + 2 Elo ratings = 45 total.
+# Log loss: 0.6676 (honest, no lookahead, Elo adds -17.8bp).
+# Elo captures team quality trajectory — orthogonal to rolling stats
+# and static projections. FiveThirtyEight's primary MLB signal.
 
 PRUNED_FEATURES = [
     # Projections (strongest signal)
@@ -80,6 +80,9 @@ PRUNED_FEATURES = [
     "home_proj_sp_fip",
     "diff_proj_sp_sust",
     "home_proj_sp_war",
+    # Elo ratings (trajectory signal — -17.8bp improvement)
+    "home_elo",
+    "away_elo",
     # Team rolling
     "diff_pyth_t30",
     "diff_pyth_t14",
@@ -156,12 +159,13 @@ def get_feature_layers():
                          "proj_lineup_woba", "proj_lineup_bb_score"],
         },
         6: {
-            "name": "+ Rest/Handedness/Splits",
-            "description": "Rest days, platoon advantage, arsenal x handedness interactions, venue splits",
+            "name": "+ Elo/Handedness/Splits",
+            "description": "Elo ratings, platoon advantage, arsenal x handedness interactions, venue splits",
             "patterns": ["rest_days", "platoon_adv",
                          "sp_same_hand_pct",
                          "velo_x_same_hand", "ivb_x_same_hand",
-                         "venue_wpct", "venue_rs", "venue_ra"],
+                         "venue_wpct", "venue_rs", "venue_ra",
+                         "elo"],
         },
     }
     return layers

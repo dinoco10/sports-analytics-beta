@@ -1020,6 +1020,115 @@ def compute_projection_features(games_df, hitting_df, pitcher_maps, hitter_maps)
     return pd.DataFrame(results)
 
 
+# ═══════════════════════════════════════════════════════════════
+# ELO RATINGS
+# ═══════════════════════════════════════════════════════════════
+
+# Elo constants — tuned for MLB
+ELO_K = 4                # Update magnitude per game (MLB is low-variance)
+ELO_HOME_ADV = 24        # ~54% implied home win rate
+ELO_MEAN = 1500          # League average
+ELO_SEASON_REVERT = 0.33 # Regress 1/3 toward mean between seasons
+ELO_MOV_MULTIPLIER = True  # Scale K by margin of victory
+
+
+def _elo_expected(rating_a, rating_b):
+    """Expected win probability for team A given ratings."""
+    return 1.0 / (1.0 + 10.0 ** ((rating_b - rating_a) / 400.0))
+
+
+def _elo_mov_mult(mov, elo_diff):
+    """
+    Margin-of-victory multiplier (FiveThirtyEight formula).
+    Rewards blowouts slightly more, but diminishing returns.
+    Accounts for autocorrelation: winning team with higher Elo
+    gets less credit for running up the score.
+    """
+    if mov == 0:
+        return 1.0
+    return np.log(abs(mov) + 1) * (2.2 / ((elo_diff * 0.001) + 2.2))
+
+
+def compute_elo_ratings(games_df):
+    """
+    Compute running Elo ratings for all teams across all games.
+
+    Returns a DataFrame with game_id, home_elo, away_elo, diff_elo.
+    Elo values are PRE-GAME ratings (before the game result updates them).
+    Season boundaries trigger a regression toward the mean.
+
+    The Elo system captures team quality trajectory — something rolling
+    stats and static projections can't. It's orthogonal to both.
+    """
+    # Sort chronologically
+    games = games_df.sort_values(["date", "game_id"]).copy()
+
+    # Initialize all teams at 1500
+    all_teams = set(games["home_team_id"].unique()) | set(games["away_team_id"].unique())
+    elo = {team: ELO_MEAN for team in all_teams}
+
+    results = []
+    prev_season = None
+
+    for _, game in games.iterrows():
+        season = game["season"]
+        home_id = game["home_team_id"]
+        away_id = game["away_team_id"]
+
+        # Season boundary: regress toward mean
+        if prev_season is not None and season != prev_season:
+            for team in elo:
+                elo[team] = elo[team] + ELO_SEASON_REVERT * (ELO_MEAN - elo[team])
+
+        prev_season = season
+
+        # Pre-game ratings (what the model sees)
+        home_rating = elo.get(home_id, ELO_MEAN)
+        away_rating = elo.get(away_id, ELO_MEAN)
+
+        results.append({
+            "game_id": game["game_id"],
+            "home_elo": round(home_rating, 1),
+            "away_elo": round(away_rating, 1),
+            "diff_elo": round(home_rating - away_rating, 1),
+        })
+
+        # Update ratings if game has a result
+        home_score = game.get("home_score")
+        away_score = game.get("away_score")
+
+        if pd.notna(home_score) and pd.notna(away_score):
+            # Include home advantage in expected score
+            home_expected = _elo_expected(
+                home_rating + ELO_HOME_ADV, away_rating
+            )
+            home_actual = 1.0 if home_score > away_score else 0.0
+
+            k = ELO_K
+            if ELO_MOV_MULTIPLIER:
+                mov = abs(home_score - away_score)
+                elo_diff = abs(home_rating - away_rating)
+                k = k * _elo_mov_mult(mov, elo_diff)
+
+            # Update both teams
+            update = k * (home_actual - home_expected)
+            elo[home_id] = home_rating + update
+            elo[away_id] = away_rating - update
+
+    elo_df = pd.DataFrame(results)
+
+    # Summary stats
+    final_elos = sorted(elo.items(), key=lambda x: -x[1])
+    top3 = [f"team {t}: {r:.0f}" for t, r in final_elos[:3]]
+    bot3 = [f"team {t}: {r:.0f}" for t, r in final_elos[-3:]]
+    print(f"  Elo ratings computed for {len(results)} games")
+    print(f"    Top 3: {', '.join(top3)}")
+    print(f"    Bot 3: {', '.join(bot3)}")
+    print(f"    Elo spread: {final_elos[0][1]:.0f} to {final_elos[-1][1]:.0f}")
+
+    return elo_df
+
+
 def compute_team_projection_features(games_df):
     """
     Add team-level projected WAR from Marcel snapshots.
@@ -1107,7 +1216,8 @@ def compute_team_projection_features(games_df):
 def assemble_game_features(games_df, team_features, sp_features, bp_features,
                            lineup_features=None, projection_features=None,
                            rest_days_df=None, handedness_df=None,
-                           venue_splits_df=None, team_proj_features=None):
+                           venue_splits_df=None, team_proj_features=None,
+                           elo_df=None):
     """Merge all feature layers into a single game-level matrix."""
 
     result = games_df[["game_id", "mlb_game_id", "date", "season",
@@ -1215,6 +1325,13 @@ def assemble_game_features(games_df, team_features, sp_features, bp_features,
         result = result.merge(
             team_proj_features[['game_id'] + tp_cols],
             on='game_id', how='left'
+        )
+
+    # --- Elo ratings ---
+    if elo_df is not None and len(elo_df) > 0:
+        result = result.merge(
+            elo_df[["game_id", "home_elo", "away_elo", "diff_elo"]],
+            on="game_id", how="left"
         )
 
     # --- Rest days (Layer 6a) ---
@@ -1364,9 +1481,17 @@ def main():
     except Exception as e:
         print(f"  Projection features skipped: {e}")
 
-    # Layer 5b: Team-level projected WAR
+    # Layer 5b: Elo ratings
+    elo_df = None
+    print("\n[8/13] Computing Elo ratings...")
+    try:
+        elo_df = compute_elo_ratings(games)
+    except Exception as e:
+        print(f"  Elo ratings skipped: {e}")
+
+    # Layer 5c: Team-level projected WAR
     team_proj_features = None
-    print("\n[8/12] Computing team projection features (Layer 5b)...")
+    print("\n[9/13] Computing team projection features (Layer 5c)...")
     try:
         team_proj_features = compute_team_projection_features(games)
         if team_proj_features is not None and len(team_proj_features) > 0:
@@ -1378,7 +1503,7 @@ def main():
 
     # Layer 6a: Rest days (computed from game dates)
     rest_days_df = None
-    print("\n[9/12] Computing rest days (Layer 6a)...")
+    print("\n[10/13] Computing rest days (Layer 6a)...")
     try:
         rest_days_df = compute_rest_days(games)
     except Exception as e:
@@ -1386,7 +1511,7 @@ def main():
 
     # Layer 6b: Handedness matchups (platoon advantage)
     handedness_df = None
-    print("\n[10/12] Computing handedness features (Layer 6b)...")
+    print("\n[11/13] Computing handedness features (Layer 6b)...")
     try:
         if hitters is None:
             hitters = load_hitting_stats(conn)
@@ -1396,19 +1521,19 @@ def main():
 
     # Layer 6c: Home/away venue splits
     venue_splits_df = None
-    print("\n[11/12] Computing home/away venue splits (Layer 6c)...")
+    print("\n[12/13] Computing home/away venue splits (Layer 6c)...")
     try:
         venue_splits_df = compute_home_away_splits(games)
     except Exception as e:
         print(f"  Venue splits skipped: {e}")
 
     # ---- Assemble ----
-    print("\n[12/12] Assembling game feature matrix...")
+    print("\n[13/13] Assembling game feature matrix...")
     game_features = assemble_game_features(
         games, team_features, sp_features, bp_features,
         lineup_features, projection_features,
         rest_days_df, handedness_df, venue_splits_df,
-        team_proj_features
+        team_proj_features, elo_df
     )
     
     if args.season:

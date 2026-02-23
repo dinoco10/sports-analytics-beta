@@ -11,6 +11,8 @@
     "home_proj_sp_fip",
     "diff_proj_sp_sust",
     "home_proj_sp_war",
+    "home_elo",
+    "away_elo",
     "diff_pyth_t30",
     "diff_pyth_t14",
     "away_team_whip_t14",
@@ -44,7 +46,7 @@
     "away_venue_wpct",
     "diff_venue_wpct"
   ],
-  "log_loss": 0.6694471701083423,
+  "log_loss": 0.6676789555924716,
   "test_season": 2025,
   "max_depth": 2,
   "pruned": true

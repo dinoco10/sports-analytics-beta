@@ -10,6 +10,8 @@
   "home_proj_sp_fip": 4.24,
   "diff_proj_sp_sust": 0.0,
   "home_proj_sp_war": 0.0,
+  "home_elo": 1503.4,
+  "away_elo": 1503.3,
   "diff_pyth_t30": 7.804496113250625e-05,
   "diff_pyth_t14": -0.00032218294563515,
   "away_team_whip_t14": 1.0698821221478032,
