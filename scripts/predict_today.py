@@ -57,6 +57,7 @@ from build_features import (
     compute_rest_days,
     compute_handedness_features,
     compute_home_away_splits,
+    compute_sp_game_score,
     assemble_game_features,
     TEAM_WINDOWS,
     SP_WINDOWS,
@@ -302,6 +303,13 @@ def predict_games(target_date, save=False, backtest=False):
     print("  SP rolling stats...")
     sp_features = compute_pitcher_rolling(pitchers, windows=SP_WINDOWS)
 
+    print("  SP Game Score (538 rGS)...")
+    try:
+        sp_rgs_features = compute_sp_game_score(pitchers, all_games)
+    except Exception as e:
+        print(f"    SP Game Score skipped: {e}")
+        sp_rgs_features = None
+
     print("  Bullpen rolling stats...")
     bp_features = compute_bullpen_rolling(pitchers, all_games, windows=BP_WINDOWS)
 
@@ -366,6 +374,7 @@ def predict_games(target_date, save=False, backtest=False):
         lineup_features, projection_features,
         rest_days_df, handedness_df, venue_splits_df,
         team_proj_features, elo_df,
+        sp_rgs_features=sp_rgs_features,
     )
 
     # Filter to today's games only

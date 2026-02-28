@@ -111,6 +111,212 @@ def kelly_size(edge, decimal_odds, bankroll, fraction=KELLY_FRACTION):
 
 
 # ═══════════════════════════════════════════════════════════════
+# O/U & RUN LINE HELPERS
+# ═══════════════════════════════════════════════════════════════
+
+def load_run_models():
+    """Load the home/away run prediction models + distribution engine."""
+    try:
+        import lightgbm as lgb
+        home_path = ROOT / "models" / "run_home_lgbm.txt"
+        away_path = ROOT / "models" / "run_away_lgbm.txt"
+        meta_path = ROOT / "models" / "run_model_meta.json"
+        medians_path = ROOT / "models" / "run_feature_medians.json"
+
+        if not home_path.exists() or not away_path.exists():
+            return None, None, None, None, None
+
+        home_model = lgb.Booster(model_file=str(home_path))
+        away_model = lgb.Booster(model_file=str(away_path))
+
+        with open(meta_path) as f:
+            meta = json.load(f)
+        with open(medians_path) as f:
+            medians = json.load(f)
+
+        sys.path.insert(0, str(ROOT))
+        from src.models.run_distribution import RunDistribution
+        rd = RunDistribution(
+            phi_home=meta.get("phi_home", 5.0),
+            phi_away=meta.get("phi_away", 5.0)
+        )
+
+        return home_model, away_model, rd, meta, medians
+
+    except Exception as e:
+        print(f"  Run models not available: {e}")
+        return None, None, None, None, None
+
+
+def totals_implied_prob(over_ml, under_ml):
+    """Convert O/U moneylines to fair implied probabilities."""
+    over_raw = american_to_implied_prob(over_ml)
+    under_raw = american_to_implied_prob(under_ml)
+    total = over_raw + under_raw
+    return over_raw / total, under_raw / total
+
+
+def find_totals_value(predictions_df, odds_df, run_dist, home_model, away_model,
+                      meta, medians, min_edge=MIN_EDGE):
+    """
+    Find O/U and run line value bets using the run distribution model.
+
+    Requires odds_df to have columns: total_line, over_ml, under_ml
+    (optional: home_rl, away_rl for run line)
+    """
+    features = meta.get("features", [])
+    bets = []
+
+    # Load game features for run prediction
+    features_path = ROOT / "data" / "features" / "game_features.csv"
+    if not features_path.exists():
+        return pd.DataFrame()
+
+    game_features = pd.read_csv(features_path)
+
+    for _, pred in predictions_df.iterrows():
+        # Match to odds
+        odds_match = odds_df[
+            (odds_df["home_team"].str.contains(pred["home_team"], case=False, na=False)) |
+            (odds_df["home_team"] == pred["home_team"])
+        ]
+        if len(odds_match) == 0:
+            continue
+        odds_row = odds_match.iloc[0]
+
+        # Need total_line and over/under MLs
+        total_line = odds_row.get("total_line")
+        over_ml = odds_row.get("over_ml")
+        under_ml = odds_row.get("under_ml")
+
+        if pd.isna(total_line) or pd.isna(over_ml) or pd.isna(under_ml):
+            continue
+
+        # Get game features for run prediction
+        game_match = game_features[
+            (game_features["home_team_id"] == pred.get("home_team_id")) &
+            (game_features["date"] == pred.get("date"))
+        ]
+        if len(game_match) == 0:
+            # Try matching by team names from the predictions
+            continue
+
+        game_row = game_match.iloc[0]
+
+        # Build feature vector
+        X = []
+        for feat in features:
+            val = game_row.get(feat)
+            if pd.isna(val):
+                val = medians.get(feat, 0)
+            X.append(val)
+
+        X = np.array([X])
+
+        # Predict runs
+        mu_home = home_model.predict(X)[0]
+        mu_away = away_model.predict(X)[0]
+
+        # O/U probability
+        p_over, p_under = run_dist.over_under_probability(mu_home, mu_away, total_line)
+
+        # Vegas implied
+        vegas_over, vegas_under = totals_implied_prob(over_ml, under_ml)
+
+        sportsbook = odds_row.get("sportsbook", "unknown")
+
+        # Check over edge
+        over_edge = p_over - vegas_over
+        if over_edge >= min_edge:
+            dec_odds = american_to_decimal(over_ml)
+            ev = p_over * (dec_odds - 1) - (1 - p_over)
+            kelly = kelly_size(over_edge, dec_odds, BANKROLL)
+            bets.append({
+                "date": pred.get("date", ""),
+                "home_team": pred["home_team"],
+                "away_team": pred["away_team"],
+                "bet_type": "OVER",
+                "side": f"OVER {total_line}",
+                "team_bet": f"Over {total_line}",
+                "model_prob": p_over,
+                "vegas_prob": vegas_over,
+                "edge": over_edge,
+                "ev_per_dollar": ev,
+                "ml": over_ml,
+                "kelly_stake": kelly,
+                "flat_stake": FLAT_STAKE,
+                "sportsbook": sportsbook,
+                "mu_home": mu_home,
+                "mu_away": mu_away,
+            })
+
+        # Check under edge
+        under_edge = p_under - vegas_under
+        if under_edge >= min_edge:
+            dec_odds = american_to_decimal(under_ml)
+            ev = p_under * (dec_odds - 1) - (1 - p_under)
+            kelly = kelly_size(under_edge, dec_odds, BANKROLL)
+            bets.append({
+                "date": pred.get("date", ""),
+                "home_team": pred["home_team"],
+                "away_team": pred["away_team"],
+                "bet_type": "UNDER",
+                "side": f"UNDER {total_line}",
+                "team_bet": f"Under {total_line}",
+                "model_prob": p_under,
+                "vegas_prob": vegas_under,
+                "edge": under_edge,
+                "ev_per_dollar": ev,
+                "ml": under_ml,
+                "kelly_stake": kelly,
+                "flat_stake": FLAT_STAKE,
+                "sportsbook": sportsbook,
+                "mu_home": mu_home,
+                "mu_away": mu_away,
+            })
+
+        # Run line (if available)
+        home_rl = odds_row.get("home_rl_ml") or odds_row.get("home_rl")
+        away_rl = odds_row.get("away_rl_ml") or odds_row.get("away_rl")
+        if pd.notna(home_rl) and pd.notna(away_rl):
+            # Standard -1.5 run line
+            p_home_cover, p_away_cover = run_dist.run_line_probability(
+                mu_home, mu_away, spread=-1.5
+            )
+
+            # Home -1.5
+            rl_edge = p_home_cover - american_to_implied_prob(home_rl) / (
+                american_to_implied_prob(home_rl) + american_to_implied_prob(away_rl))
+            if rl_edge >= min_edge:
+                dec_odds = american_to_decimal(home_rl)
+                ev = p_home_cover * (dec_odds - 1) - (1 - p_home_cover)
+                kelly = kelly_size(rl_edge, dec_odds, BANKROLL)
+                bets.append({
+                    "date": pred.get("date", ""),
+                    "home_team": pred["home_team"],
+                    "away_team": pred["away_team"],
+                    "bet_type": "RL_HOME",
+                    "side": "HOME -1.5",
+                    "team_bet": f"{pred['home_team']} -1.5",
+                    "model_prob": p_home_cover,
+                    "vegas_prob": american_to_implied_prob(home_rl),
+                    "edge": rl_edge,
+                    "ev_per_dollar": ev,
+                    "ml": home_rl,
+                    "kelly_stake": kelly,
+                    "flat_stake": FLAT_STAKE,
+                    "sportsbook": sportsbook,
+                    "mu_home": mu_home,
+                    "mu_away": mu_away,
+                })
+
+    if not bets:
+        return pd.DataFrame()
+
+    return pd.DataFrame(bets).sort_values("edge", ascending=False).reset_index(drop=True)
+
+
+# ═══════════════════════════════════════════════════════════════
 # LOAD PREDICTIONS
 # ═══════════════════════════════════════════════════════════════
 
@@ -653,13 +859,46 @@ def main():
         print("  No odds provided. Exiting.")
         return
 
-    # Find value bets
+    # ── Moneyline value bets ──
     bets_df = find_value_bets(preds_df, odds_df, min_edge=args.min_edge)
-
-    # Display
     display_recommendations(bets_df, target_date)
 
-    # Save
+    # ── O/U and Run Line value bets ──
+    home_model, away_model, run_dist, run_meta, run_medians = load_run_models()
+    if home_model is not None and "total_line" in odds_df.columns:
+        print(f"\n{'=' * 72}")
+        print(f"  O/U & RUN LINE RECOMMENDATIONS — {target_date}")
+        print(f"{'=' * 72}")
+
+        totals_df = find_totals_value(
+            preds_df, odds_df, run_dist, home_model, away_model,
+            run_meta, run_medians, min_edge=args.min_edge
+        )
+
+        if len(totals_df) > 0:
+            print(f"\n  Found {len(totals_df)} O/U/RL value bet(s):\n")
+            for _, b in totals_df.iterrows():
+                matchup = f"{b['away_team']} @ {b['home_team']}"
+                print(f"    {matchup}")
+                print(f"    {b['side']} ({b['ml']:+.0f})")
+                print(f"    Model: {b['model_prob']:.1%}  |  Vegas: {b['vegas_prob']:.1%}  |  "
+                      f"Edge: {b['edge']:.1%}  |  EV: ${b['ev_per_dollar']*100:+.1f}/100")
+                if 'mu_home' in b and pd.notna(b.get('mu_home')):
+                    print(f"    Predicted: {b['mu_home']:.1f}-{b['mu_away']:.1f} "
+                          f"(total: {b['mu_home']+b['mu_away']:.1f})")
+                print()
+
+            # Combine ML + totals for saving
+            if args.save:
+                all_bets = pd.concat([bets_df, totals_df], ignore_index=True) if len(bets_df) > 0 else totals_df
+                save_bets(all_bets, target_date)
+                return
+        else:
+            print("  No O/U or run line value found.")
+    elif home_model is None:
+        print("\n  (Run models not found — train with: python scripts/train_run_model.py --save)")
+
+    # Save ML-only bets
     if args.save and len(bets_df) > 0:
         save_bets(bets_df, target_date)
 

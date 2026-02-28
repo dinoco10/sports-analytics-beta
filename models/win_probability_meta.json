@@ -10,7 +10,6 @@
     "home_proj_sp_sc_era",
     "home_proj_sp_fip",
     "diff_proj_sp_sust",
-    "home_proj_sp_war",
     "home_elo",
     "away_elo",
     "diff_pyth_t30",
@@ -41,12 +40,15 @@
     "away_platoon_adv",
     "away_velo_x_same_hand",
     "home_velo_x_same_hand",
-    "home_ivb_x_same_hand",
     "home_venue_wpct",
     "away_venue_wpct",
-    "diff_venue_wpct"
+    "home_sp_rgs",
+    "away_sp_rgs",
+    "diff_sp_rgs",
+    "park_factor_runs",
+    "park_factor_hr"
   ],
-  "log_loss": 0.6676789555924716,
+  "log_loss": 0.667062859715077,
   "test_season": 2025,
   "max_depth": 2,
   "pruned": true

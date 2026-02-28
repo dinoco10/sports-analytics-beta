@@ -60,12 +60,14 @@ FEATURES_PATH = Path(__file__).parent.parent / "data" / "features" / "game_featu
 MODELS_DIR = Path(__file__).parent.parent / "models"
 
 # ===================================================================
-# PRUNED FEATURE SET — top 45 by LightGBM split importance
+# PRUNED FEATURE SET — 47 features, curated by ablation
 # ===================================================================
-# 43 curated features + 2 Elo ratings = 45 total.
-# Log loss: 0.6676 (honest, no lookahead, Elo adds -17.8bp).
-# Elo captures team quality trajectory — orthogonal to rolling stats
-# and static projections. FiveThirtyEight's primary MLB signal.
+# 42 base + 2 Elo + 3 SP Game Score (538 rGS) - 2 pruned noise + 2 park = 47.
+# Log loss: 0.6670 (5-seed avg).
+# rGS adds -4bp; pruning 3 noisy features saves -3bp; park factors -2.5bp.
+# Dropped: home_proj_sp_war (<1bp), diff_venue_wpct (-1.4bp noise),
+#          home_ivb_x_same_hand (-2.8bp noise).
+# Tested & rejected: def_eff (+9.1bp diff, -1.6bp h/a — not worth complexity).
 
 PRUNED_FEATURES = [
     # Projections (strongest signal)
@@ -79,7 +81,6 @@ PRUNED_FEATURES = [
     "home_proj_sp_sc_era",
     "home_proj_sp_fip",
     "diff_proj_sp_sust",
-    "home_proj_sp_war",
     # Elo ratings (trajectory signal — -17.8bp improvement)
     "home_elo",
     "away_elo",
@@ -114,14 +115,21 @@ PRUNED_FEATURES = [
     # Handedness matchups (Layer 6 — ~80bp improvement)
     "home_platoon_adv",
     "away_platoon_adv",
-    # Arsenal x handedness interactions
+    # Arsenal x handedness interactions (velo survives, IVB pruned)
     "away_velo_x_same_hand",
     "home_velo_x_same_hand",
-    "home_ivb_x_same_hand",
-    # Venue-specific splits (home-only / away-only rolling win%)
+    # Venue-specific splits (home/away venue wpct only — diff was noise)
     "home_venue_wpct",
     "away_venue_wpct",
-    "diff_venue_wpct",
+    # SP Game Score (538's rGS — rolling avg game score per SP)
+    # Ablation: home/away/diff = -4bp; diff_sp_rgs_adj hurts (+10bp)
+    "home_sp_rgs",
+    "away_sp_rgs",
+    "diff_sp_rgs",
+    # Park factors (Statcast, 100-scale converted to multiplier)
+    # Ablation: both runs+HR = -2.5bp; runs alone = noise
+    "park_factor_runs",
+    "park_factor_hr",
 ]
 
 def get_feature_layers():

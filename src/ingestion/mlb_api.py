@@ -176,6 +176,90 @@ class MLBApiClient:
         
         return pd.DataFrame(pitchers), pd.DataFrame(hitters)
     
+    # ─── Game Weather & Venue ────────────────────────────
+
+    def get_game_weather(self, game_id: int) -> dict:
+        """
+        Extract weather and venue info from a game's live feed.
+
+        Returns dict with:
+          - temperature_f (int or None)
+          - wind_speed_mph (int or None)
+          - wind_direction (str or None) — e.g. "Out To CF", "In From LF", "Calm"
+          - condition (str or None) — e.g. "Partly Cloudy", "Clear", "Dome"
+          - venue_id (int or None)
+          - venue_name (str or None)
+          - elevation_ft (int or None)
+          - azimuth_angle (float or None) — field orientation in degrees
+          - latitude (float or None)
+          - longitude (float or None)
+
+        The MLB API live feed at v1.1/game/{id}/feed/live contains gameData.weather
+        and gameData.venue with all this data. We parse it into a flat dict.
+        Note: Must use v1.1 endpoint (v1 returns 404 for game feeds).
+        """
+        # Use v1.1 endpoint directly — the default base_url is v1 which 404s on feeds
+        url = f"https://statsapi.mlb.com/api/v1.1/game/{game_id}/feed/live"
+        try:
+            response = self.session.get(url, timeout=30)
+            response.raise_for_status()
+            time.sleep(0.5)
+            data = response.json()
+        except requests.exceptions.RequestException as e:
+            logger.error(f"API request failed: {url} — {e}")
+            return {}
+        if not data:
+            return {}
+
+        game_data = data.get("gameData", {})
+        weather = game_data.get("weather", {})
+        venue = game_data.get("venue", {})
+        location = venue.get("location", {})
+        coords = location.get("defaultCoordinates", {})
+
+        # Parse temperature — API returns string like "79"
+        temp = None
+        try:
+            temp = int(weather.get("temp", ""))
+        except (ValueError, TypeError):
+            pass
+
+        # Parse wind — API returns string like "6 mph, Out To CF" or "6 mph, Calm"
+        wind_speed = None
+        wind_dir = None
+        wind_str = weather.get("wind", "")
+        if wind_str:
+            parts = wind_str.split(",", 1)
+            # Extract speed number
+            speed_part = parts[0].strip()
+            try:
+                wind_speed = int(speed_part.split()[0])
+            except (ValueError, IndexError):
+                pass
+            # Extract direction
+            if len(parts) > 1:
+                wind_dir = parts[1].strip()
+
+        # Parse elevation
+        elevation = None
+        try:
+            elevation = int(location.get("elevation", ""))
+        except (ValueError, TypeError):
+            pass
+
+        return {
+            "temperature_f": temp,
+            "wind_speed_mph": wind_speed,
+            "wind_direction": wind_dir,
+            "condition": weather.get("condition"),
+            "venue_id": venue.get("id"),
+            "venue_name": venue.get("name"),
+            "elevation_ft": elevation,
+            "azimuth_angle": location.get("azimuthAngle"),
+            "latitude": coords.get("latitude"),
+            "longitude": coords.get("longitude"),
+        }
+
     # ─── Rosters ──────────────────────────────────────────
     
     def get_roster(self, team_id: int, roster_type: str = "active") -> pd.DataFrame:

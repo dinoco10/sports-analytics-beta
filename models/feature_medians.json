@@ -9,7 +9,6 @@
   "home_proj_sp_sc_era": 4.36,
   "home_proj_sp_fip": 4.24,
   "diff_proj_sp_sust": 0.0,
-  "home_proj_sp_war": 0.0,
   "home_elo": 1503.4,
   "away_elo": 1503.3,
   "diff_pyth_t30": 7.804496113250625e-05,
@@ -40,8 +39,11 @@
   "away_platoon_adv": 0.4545454545454545,
   "away_velo_x_same_hand": 51.21818181818182,
   "home_velo_x_same_hand": 51.21818181818182,
-  "home_ivb_x_same_hand": 6.9818181818181815,
   "home_venue_wpct": 0.5333333333333333,
   "away_venue_wpct": 0.4666666666666667,
-  "diff_venue_wpct": 0.0666666666666666
+  "home_sp_rgs": 53.464852941176474,
+  "away_sp_rgs": 53.47713043478261,
+  "diff_sp_rgs": 0.03531609195401935,
+  "park_factor_runs": 1.0,
+  "park_factor_hr": 0.99
 }
