@@ -1,0 +1,258 @@
+BOUNCE-BACK THREAD - 2026 MLB Season
+=======================================
+"These Hitters Are Being Slept On Heading Into 2026"
+Based on Statcast expected metrics, BABIP bad luck, and contact quality analysis.
+
+Thread below
+
+---
+
+TWEET 1 (HOOK):
+The surface numbers lied about these hitters in 2025.
+
+Our model flagged 8 hitters whose UNDERLYING contact quality was significantly
+better than their results showed. BABIP bad luck, sequencing, and variance
+crushed their stat lines.
+
+Expected metrics paint a VERY different picture.
+
+Thread below
+
+---
+
+TWEET 2 - Salvador Perez (Royals, age 36)
+Bounce-Back Score: 100/100
+
+SURFACE: .311 wOBA in 641 PA. Down year for Salvy. Aging catcher, right?
+REALITY: His xwOBA was .357 -- a -46 POINT gap. He was the UNLUCKIEST hitter in MLB.
+
+2023 -> 2024 -> 2025:
+- Barrel%: 8.8 -> 12.2 -> 14.8 (career high! Getting BETTER)
+- Hard Hit%: 44.0 -> 44.8 -> 46.7 (career high!)
+- xwOBA: .326 -> .361 -> .357 (elite contact quality two years running)
+- BABIP: .294 -> .302 -> .251 (FORTY-SEVEN points below career average)
+
+His BABIP cratered to .251 despite hitting the ball harder than ever. That's pure
+bad luck -- balls finding gloves instead of gaps.
+
+The barrel rate IMPROVED for the third straight year. The hard hit rate is at a
+career high. At 36, most catchers are declining -- Salvy is somehow getting better
+at making hard contact.
+
+Chase rate dropped from 47% to 42.4%, whiff rate from 30.2% to 26.9%. Even the
+discipline is trending the right direction.
+
+VERDICT: Expect .340-.355 wOBA. The power is REAL and the BABIP will normalize.
+This is a buy-low screaming at you.
+
+---
+
+TWEET 3 - Oneil Cruz (Pirates, age 28)
+Bounce-Back Score: 99/100
+
+SURFACE: .295 wOBA in 544 PA. Disappointing follow-up to his 2024 breakout.
+REALITY: xwOBA was .324 -- and his raw tools are ABSURD.
+
+2024 -> 2025:
+- EV: 95.5 -> 95.8 (top 1% in MLB. Only Judge and Stanton are in this tier)
+- Barrel%: 15.7 -> 17.9 (INCREASED)
+- Hard Hit%: 54.9 -> 56.6 (INCREASED)
+- BABIP: .347 -> .262 (EIGHTY-FIVE points below his 2024)
+- K%: 30.2 -> 32.0 (still too high, but...)
+- BB%: 8.5 -> 11.8 (improved significantly!)
+- Chase%: 31.7 -> 28.1 (BETTER discipline)
+
+Everything under the hood got BETTER. His exit velocity is 95.8 mph -- that's
+historically elite. His barrel rate jumped to 17.9%. His walk rate improved by
+3.3 percentage points. His chase rate dropped.
+
+The ONLY thing that went wrong was a .262 BABIP. With his speed and hard contact,
+that should be .310-320. That's a 50-60 point correction waiting to happen.
+
+VERDICT: .340-.360 wOBA with 35+ HR upside. The tools are generational.
+His .295 wOBA was one of the most misleading stat lines in 2025.
+
+---
+
+TWEET 4 - Juan Soto (Mets, age 28)
+Bounce-Back Score: 98/100
+
+SURFACE: .390 wOBA in 715 PA. Most players would KILL for this line.
+REALITY: His xwOBA was .429. He LEFT production on the table.
+
+2023 -> 2024 -> 2025:
+- Barrel%: 13.0 -> 19.7 -> 18.1 (elite tier)
+- xwOBA: .407 -> .463 -> .429 (consistently top-5 in MLB)
+- BABIP: .296 -> .298 -> .270 (28 points below career norm)
+- Chase%: 16.6 -> 18.3 -> 15.9 (MLB's BEST chase rate)
+- BB%: 18.6 -> 18.1 -> 17.8 (most disciplined hitter in baseball)
+
+Yes, .390 wOBA is amazing. But Soto's TRUE talent level is .420-.430.
+The gap between .390 and .429 xwOBA is about 15-20 points of wRC+.
+
+His chase rate of 15.9% is the BEST in MLB. His barrel rate is 18.1%.
+His walk rate is 17.8%. This is a generational plate appearance.
+
+The "down year" was caused by a .270 BABIP -- 28 points below his career average.
+When that normalizes, he's back to being the best hitter in baseball.
+
+VERDICT: .415-.430 wOBA. First year in the Mets lineup, expect the crown back.
+The $765M man is worth every penny.
+
+---
+
+TWEET 5 - Seiya Suzuki (Cubs, age 32)
+Bounce-Back Score: 96/100
+
+SURFACE: .343 wOBA over 651 PA. Solid but unspectacular.
+REALITY: xwOBA was .352, but the real story is the BABIP.
+
+2023 -> 2024 -> 2025:
+- BABIP: .341 -> .370 -> .282 (career average is .356 -- he was 74 POINTS below)
+- Barrel%: 10.5 -> 11.5 -> 16.6 (CAREER HIGH by a wide margin)
+- Pull Air%: 37.0 -> 32.6 -> 41.9 (pulling the ball in the air more = HR intent)
+- K%: 22.3 -> 27.4 -> 25.2 (improved from '24)
+- Chase%: 19.8 -> 20.7 -> 20.5 (consistently elite)
+
+Suzuki had a 16.6% barrel rate in 2025 -- that's top-20 in MLB. He pulled the ball
+in the air at 41.9%, the highest rate of his career. He's clearly selling out for power.
+
+And it WORKED in terms of contact quality. But his BABIP crashed to .282, wiping out
+all the improvement. Career BABIP is .356 -- a 74-point gap.
+
+The approach shift is real and sustainable. The BABIP won't stay at .282.
+
+VERDICT: .360-.375 wOBA. The power breakout is real. When luck normalizes,
+Suzuki could post a career year at 32.
+
+---
+
+TWEET 6 - Adley Rutschman (Orioles, age 28)
+Bounce-Back Score: 93/100
+
+SURFACE: .298 wOBA in just 365 PA. Injuries limited him. Concerning.
+REALITY: xwOBA was .325 -- and the underlying profile screams elite.
+
+2023 -> 2024 -> 2025:
+- xwOBA: .374 -> .320 -> .325 (bouncing back from 2024 dip)
+- BABIP: .303 -> .272 -> .240 (TWO straight years of BABIP hell)
+- K%: 14.7 -> 16.1 -> 15.6 (elite contact ability)
+- BB%: 13.4 -> 9.1 -> 11.0 (walk rate recovering)
+- Chase%: 23.4 -> 28.9 -> 21.7 (chase rate PLUMMETED -- best of career)
+- Whiff%: 17.1 -> 14.5 (career low!)
+- Barrel%: 7.5 -> 6.1 -> 7.5 (back to 2023 level)
+
+Rutschman's .240 BABIP is absurd for a hitter with his contact profile.
+His whiff rate dropped to 14.5% (career low), his chase rate dropped to 21.7%
+(career low), and his K% stayed at an elite 15.6%.
+
+He's making the BEST contact of his career by process metrics, and getting the
+WORST results. That's the definition of bad luck.
+
+With health, his true talent is .340-.360 wOBA. Even the conservative projection
+at .332 xwOBA-adjusted is far above his .298 result.
+
+VERDICT: .340-.360 wOBA with full health. The process has never been better.
+Buy the dip on the best young catcher in baseball.
+
+---
+
+TWEET 7 - Corey Seager (Rangers, age 32) & Luis Robert Jr. (Mets, age 29)
+
+SEAGER (bb: 90):
+- 2025: .365 wOBA looks solid, but xwOBA was .400 -- he left 35 points on the table
+- EV: 92.9 (elite), Barrel%: 15.3% (elite), Hard Hit%: 53.6% (elite)
+- BABIP: .299 (career avg ~.320)
+- BB% jumped from 9.9% to 13.0% -- became MORE patient
+- Chase% dropped to 23.0% (career best)
+- Every single process metric improved or held. Results didn't follow.
+- VERDICT: .385-.400 wOBA. Seager's elite contact quality demands a correction.
+
+ROBERT JR. (bb: 88):
+- 2025: .289 wOBA in 431 PA. Another "lost" season.
+- xwOBA: .321 -- a -32 point gap
+- K% dropped from 33.2% to 26.0% (massive 7-point improvement!)
+- BB% up from 6.6% to 9.3%
+- Chase% down from 35.9% to 32.5%
+- BABIP: .274 (should be ~.310 with his speed)
+- Barrel%: 10.2%, EV: 89.4 -- the power tools are still there
+- VERDICT: .320-.340 wOBA if healthy. The discipline transformation is the story.
+  If the K% improvement sticks, he's a completely different hitter.
+
+---
+
+TWEET 8 - Nolan Jones (Guardians, age 28)
+Bounce-Back Score: 90/100
+
+SURFACE: .270 wOBA in 403 PA. Looked like 2023 was a fluke.
+REALITY: The tools suggest otherwise.
+
+2023 -> 2024 -> 2025:
+- EV: 90.1 -> 88.2 -> 90.8 (bounced back to 2023 level)
+- Barrel%: 15.7 -> 5.9 -> 8.5 (recovering from 2024 crater)
+- Hard Hit%: 41.3 -> 44.4 -> 46.7 (career high!)
+- xwOBA: .362 -> .291 -> .301 (trending back up)
+- BABIP: .401 -> .333 -> .292 (now BELOW average)
+- K%: 29.7 -> 30.6 -> 28.0 (slight improvement)
+
+His 2023 (.395 wOBA) was inflated by a .401 BABIP. His 2025 (.270 wOBA) was
+deflated by a .292 BABIP. The truth is somewhere in the middle.
+
+The exit velocity rebounded to 90.8, hard hit% is at a career high, and the
+barrel rate is recovering from its 2024 collapse. His xwOBA of .301 suggests
+true talent around .310-.320 wOBA.
+
+VERDICT: .310-.325 wOBA. Not the 2023 star, not the 2025 bust.
+A solid 2-3 WAR player when the luck normalizes.
+
+---
+
+TWEET 9 - The Counter-Argument:
+
+Why the market is pricing these guys lower:
+- Perez: He's 36. Catchers age fast.
+- Cruz: 32% K rate is still a real problem
+- Soto: .390 is already elite -- hard to improve
+- Suzuki: K% still elevated at 25%
+- Rutschman: Health is the real question
+- Seager: Age 32, declining speed
+- Robert: Can't stay on the field
+- Jones: Still strikes out too much
+
+Valid concerns. But expected metrics account for strikeouts and contact quality.
+The BABIP gap is the part the market gets wrong.
+
+---
+
+TWEET 10 - Summary Table:
+
+Player          | 2025 wOBA | xwOBA | Gap    | BABIP | Proj 2026
+Perez           | .311      | .357  | -46    | .251  | .340-.355
+Cruz            | .295      | .324  | -29    | .262  | .340-.360
+Soto            | .390      | .429  | -39    | .270  | .415-.430
+Suzuki          | .343      | .352  | -9*    | .282  | .360-.375
+Rutschman       | .298      | .325  | -27    | .240  | .340-.360
+Seager          | .365      | .400  | -35    | .299  | .385-.400
+Robert Jr.      | .289      | .321  | -32    | .274  | .320-.340
+Jones           | .270      | .301  | -31    | .292  | .310-.325
+
+*Suzuki's gap is small in xwOBA but his BABIP was 74pts below career avg
+
+Average xwOBA gap: -31 points of suppressed production.
+
+These hitters were punished by bad luck, not bad skill.
+The data says buy. The market says sell.
+
+We're buying.
+
+Am I wrong? What am I missing? Drop your takes below.
+
+---
+
+METHODOLOGY NOTE:
+- All data from Baseball Savant (Statcast) and our Marcel-weighted projection system
+- Bounce-back scores from our proprietary model (0-100 scale)
+- xwOBA gap = actual wOBA minus expected wOBA (negative = underperformance)
+- BABIP comparison uses 3-year career average as baseline
+- Projections factor in age curves, park effects, and contact quality trends
+- "Career avg BABIP" = Marcel-weighted 3-year average (5/4/3 weighting)

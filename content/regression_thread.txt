@@ -1,0 +1,202 @@
+REGRESSION THREAD - 2026 MLB Season
+=====================================
+"These Hitters Are Due For a Reality Check in 2026"
+Based on Statcast expected metrics, BABIP luck, and contact quality analysis.
+
+Thread below
+
+---
+
+TWEET 1 (HOOK):
+The market is overvaluing these hitters heading into 2026.
+
+Our model flagged 8 hitters whose 2025 numbers were built on BABIP luck, unsustainable HR/FB rates, and xwOBA gaps that SCREAM regression.
+
+Names you won't want to hear. Data you can't ignore.
+
+Thread below
+
+---
+
+TWEET 2 - Harrison Bader (SF Giants, age 32)
+Regression Risk: 89/100
+
+SURFACE: .346 wOBA in 2025 looked like a career year. 501 PA, finally healthy.
+REALITY: His xwOBA was .297 -- a +49 POINT gap. That's the 2nd-largest gap in MLB.
+
+2023 -> 2024 -> 2025:
+- Barrel%: 5.3 -> 6.4 -> 10.2 (career high, but...)
+- BABIP: .261 -> .276 -> .359 (career avg ~.275)
+- K%: 17.2 -> 21.7 -> 27.1 (trending the WRONG way)
+
+His BABIP was 84 points above career average. That's not a new skill -- that's luck.
+The barrels improved but the strikeout rate spiked to 27.1%. Hard to sustain both.
+
+VERDICT: Expect .280-.295 wOBA range. The .346 was a mirage.
+
+---
+
+TWEET 3 - Nick Kurtz (Athletics, age 23)
+Regression Risk: 97/100
+
+SURFACE: Explosive debut -- .419 wOBA, 92.7 EV, 18.4% barrel rate. Electric.
+REALITY: xwOBA was .372. Still good! But the gap matters.
+
+2025 (debut):
+- HR/FB: 37.9% (league avg ~12%)
+- K%: 30.9% (elite power, but how many of those fly balls keep leaving?)
+- BABIP: .364 (rookie-year inflation)
+- Chase%: 22.2% (genuinely elite plate discipline)
+- Whiff%: 35.5% (high -- pitchers will exploit this)
+
+The 37.9% HR/FB rate is the red flag. Even the best power hitters (Judge, Stanton)
+sit around 25-30%. Regression to ~22-25% HR/FB alone drops his SLG by 60+ points.
+
+The talent is REAL -- 92.7 EV and 51.1% hard hit are legitimate. But 2026 projections
+should be closer to .350-.370 wOBA, not .419. Still a good hitter, just not a monster.
+
+VERDICT: Star talent, but the debut was inflated by an absurd HR/FB rate. Expect a
+"sophomore slump" that's really just normalization.
+
+---
+
+TWEET 4 - Trea Turner (Phillies, age 33)
+Regression Risk: 76/100
+
+SURFACE: .352 wOBA over 639 PA. Looked like vintage Trea.
+REALITY: xwOBA was .321 -- a +31 point gap. And the contact quality is fading.
+
+2023 -> 2024 -> 2025:
+- Barrel%: 8.4 -> 6.9 -> 5.8 (declining every year)
+- BABIP: .310 -> .331 -> .350 (rising -- propping up results)
+- EV: 89.9 -> 89.1 -> 89.3 (stable, but barrels are disappearing)
+- HR/FB: trending down from 19% to 14%
+
+At 33, his speed is declining and his barrel rate has dropped 31% in two years.
+The .350 BABIP is doing all the heavy lifting. Career BABIP is .315.
+
+The plate discipline actually improved (K% down to 16.7%, chase down to 31%),
+but when your barrels are drying up, contact quality matters more than contact rate.
+
+VERDICT: .310-.325 wOBA is more realistic. The elite speed that fueled his BABIP
+is fading, and the power tool is nearly gone.
+
+---
+
+TWEET 5 - Jose Altuve (Astros, age 36)
+Regression Risk: 76/100
+
+SURFACE: .331 wOBA with 654 PA. Iron man season. Still productive.
+REALITY: xwOBA was .300 -- the underlying numbers are deteriorating.
+
+2023 -> 2024 -> 2025:
+- EV: 86.0 -> 86.5 -> 85.1 (losing exit velocity at 36)
+- Barrel%: 8.3 -> 6.5 -> 6.2 (power fading)
+- Chase%: 32.1 -> 37.3 -> 38.9 (discipline eroding)
+- BABIP: .348 -> .337 -> .283 (already starting to correct)
+
+The good news: his BABIP actually came DOWN in 2025, meaning his .331 wOBA was
+achieved despite less luck. But the chase rate climbing to 38.9% is concerning.
+
+At 36, the bat speed is declining (EV down 1.4 mph from 2023), he's chasing more,
+and barreling less. This is the classic aging profile.
+
+VERDICT: Still a productive hitter due to elite hand-eye, but the floor is dropping.
+Expect .300-.310 wOBA. The .330+ days are numbered.
+
+---
+
+TWEET 6 - Hunter Goodman (Rockies, age 27)
+Regression Risk: 77/100
+
+SURFACE: .359 wOBA with 12.8% barrel rate and 90.8 EV. Breakout in Colorado.
+REALITY: xwOBA was .324. Playing in Coors inflates EVERYTHING.
+
+2023 -> 2024 -> 2025:
+- wOBA: .266 -> .274 -> .359 (suspicious jump)
+- xwOBA: .267 -> .283 -> .324 (real improvement is ~40pts, not ~95pts)
+- K%: 31.2 -> 28.6 -> 26.3 (improving!)
+- BABIP: .277 -> .199 -> .331 (from unlucky to lucky)
+- HR/FB: 12.5% -> 31.4% -> 27.9% (Coors-inflated)
+
+The real improvement is legitimate -- xwOBA went from .283 to .324, K% dropped,
+and he's pulling the ball more (pull air rate jumped to 48.7%).
+
+But the gap between .324 xwOBA and .359 wOBA is Coors Field doing its thing.
+His road splits will tell the real story.
+
+VERDICT: True talent is ~.320-.330 wOBA. The raw power is real but Coors
+inflates it by ~30-35 points. Still useful, but not a .359 hitter.
+
+---
+
+TWEET 7 - Sal Frelick (Brewers, age 26) & Shea Langeliers (Athletics, age 28)
+
+FRELICK (risk: 80):
+- 2025: .332 wOBA, but only 3.1% barrel rate and 85.5 EV
+- xwOBA: .299 -- a +33 point gap
+- His game is BABIP-dependent (contact + speed), but .317 is already above average
+- Only 27.4% hard hit rate. When the BABIP normalizes, there's no power to fall back on.
+- VERDICT: .295-.305 wOBA. Contact-first profile with a low ceiling.
+
+LANGELIERS (risk: 74):
+- 2025: .364 wOBA, which was a MASSIVE jump from .290/.315 in 2023-24
+- K% dropped from 29.2% to 19.7% (suspicious -- that's an 10-point drop in one year)
+- HR/FB: 27.9% (career avg ~24%)
+- BABIP: .290 (actually reasonable for once)
+- xwOBA: .328 vs .364 wOBA (+36 point gap)
+- VERDICT: The K% drop is real and sustainable if the approach held. But .340+ wOBA
+  requires the HR/FB rate to stay elevated. Expect .320-.335 wOBA -- still good, just
+  not .364.
+
+---
+
+TWEET 8 - The Counter-Argument:
+
+Why the market might disagree:
+- Bader: New ballpark in SF, better coaching staff
+- Kurtz: Genuinely elite raw power could sustain higher HR/FB than average
+- Turner: Elite bat-to-ball skills age well
+- Altuve: Inner-circle talent, has beaten age curves before
+- Goodman: Coors or not, 90.8 EV is legit
+- Langeliers: If the K% drop is real (approach change), the rest follows
+
+Fair points. But expected metrics don't care about narratives.
+The data says these numbers will come back to earth.
+
+---
+
+TWEET 9 - Summary Table:
+
+Player          | 2025 wOBA | xwOBA | Gap   | Proj 2026
+Bader           | .346      | .297  | +49   | .280-.295
+Kurtz           | .419      | .372  | +47   | .350-.370
+Turner          | .352      | .321  | +31   | .310-.325
+Altuve          | .331      | .300  | +31   | .300-.310
+Goodman         | .359      | .324  | +35   | .320-.330
+Frelick         | .332      | .299  | +33   | .295-.305
+Langeliers      | .364      | .328  | +36   | .320-.335
+
+Average xwOBA gap: +37 points. That's not skill. That's luck.
+
+---
+
+TWEET 10:
+
+The market prices in the box score. We price in the underlying data.
+
+Every single one of these hitters outperformed their expected metrics in 2025.
+History says that gap closes. Every. Single. Time.
+
+Fade accordingly.
+
+Am I wrong? What am I missing? Drop your takes below.
+
+---
+
+METHODOLOGY NOTE:
+- All data from Baseball Savant (Statcast) and our Marcel-weighted projection system
+- Regression risk scores from our proprietary model (0-100 scale)
+- xwOBA gap = actual wOBA minus expected wOBA (positive = overperformance)
+- BABIP comparison uses 3-year career average as baseline
+- Projections factor in age curves, park effects, and contact quality trends
