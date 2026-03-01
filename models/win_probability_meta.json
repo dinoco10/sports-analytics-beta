@@ -46,9 +46,10 @@
     "away_sp_rgs",
     "diff_sp_rgs",
     "park_factor_runs",
-    "park_factor_hr"
+    "park_factor_hr",
+    "ball_flight_index"
   ],
-  "log_loss": 0.667062859715077,
+  "log_loss": 0.6676256762239322,
   "test_season": 2025,
   "max_depth": 2,
   "pruned": true

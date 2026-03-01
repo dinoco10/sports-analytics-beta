@@ -43,6 +43,7 @@ from src.ingestion.mlb_api import MLBApiClient
 from build_features import (
     get_db_connection,
     load_games,
+    load_ballparks,
     load_pitching_stats,
     load_hitting_stats,
     load_player_positions,
@@ -64,6 +65,7 @@ from build_features import (
     BP_WINDOWS,
     BATTER_WINDOW,
 )
+from src.features.weather import compute_weather_features
 
 # ═══════════════════════════════════════════════════════════════
 # CONFIGURATION
@@ -367,6 +369,16 @@ def predict_games(target_date, save=False, backtest=False):
         print(f"    Venue splits skipped: {e}")
         venue_splits_df = None
 
+    # Weather & park factor features
+    weather_features = None
+    print("  Weather features...")
+    try:
+        ballparks_df = load_ballparks(conn)
+        if not ballparks_df.empty:
+            weather_features = compute_weather_features(all_games, ballparks_df)
+    except Exception as e:
+        print(f"    Weather skipped: {e}")
+
     # Assemble
     print("  Assembling features...")
     game_features = assemble_game_features(
@@ -375,6 +387,7 @@ def predict_games(target_date, save=False, backtest=False):
         rest_days_df, handedness_df, venue_splits_df,
         team_proj_features, elo_df,
         sp_rgs_features=sp_rgs_features,
+        weather_features=weather_features,
     )
 
     # Filter to today's games only

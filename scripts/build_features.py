@@ -1104,6 +1104,159 @@ def compute_team_barrel_rate(hitting_df, games_df):
 
 
 # ═══════════════════════════════════════════════════════════════
+# LAYER 8c: STATCAST BATTED BALL QUALITY
+# ═══════════════════════════════════════════════════════════════
+#
+# Per-game batted ball quality from the statcast_batted_balls table
+# (populated by backfill_statcast_batted_balls.py via pybaseball).
+#
+# Features: team rolling barrel %, pulled air %, pulled barrel %
+# These capture quality-of-contact trends better than SLG alone.
+# Pulled barrels = the "damage" metric (extra-base hits + HRs).
+
+# MLB team abbreviation → DB team_id mapping
+# The statcast_batted_balls table uses MLB abbreviations (NYY, BOS, etc.)
+# but our games table uses integer team_ids.
+MLB_ABBREV_TO_TEAM_ID = {
+    # DB IDs from teams table (id, name):
+    # 1=Athletics, 2=Pirates, 3=Padres, 4=Mariners, 5=Giants, 6=Cardinals,
+    # 7=Rays, 8=Rangers, 9=Blue Jays, 10=Twins, 11=Phillies, 12=Braves,
+    # 13=White Sox, 14=Marlins, 15=Yankees, 16=Brewers, 17=Angels,
+    # 18=Diamondbacks, 19=Orioles, 20=Red Sox, 21=Cubs, 22=Reds,
+    # 23=Guardians, 24=Rockies, 25=Tigers, 26=Astros, 27=Royals,
+    # 28=Dodgers, 29=Nationals, 30=Mets
+    "OAK": 1, "ATH": 1,
+    "PIT": 2,
+    "SD": 3, "SDP": 3,
+    "SEA": 4,
+    "SF": 5, "SFG": 5,
+    "STL": 6,
+    "TB": 7, "TBR": 7,
+    "TEX": 8,
+    "TOR": 9,
+    "MIN": 10,
+    "PHI": 11,
+    "ATL": 12,
+    "CWS": 13, "CHW": 13,
+    "MIA": 14,
+    "NYY": 15,
+    "MIL": 16,
+    "LAA": 17,
+    "ARI": 18, "AZ": 18,
+    "BAL": 19,
+    "BOS": 20,
+    "CHC": 21,
+    "CIN": 22,
+    "CLE": 23,
+    "COL": 24,
+    "DET": 25,
+    "HOU": 26,
+    "KC": 27, "KCR": 27,
+    "LAD": 28,
+    "WSH": 29, "WSN": 29,
+    "NYM": 30,
+}
+
+
+def load_statcast_batted_balls(conn):
+    """
+    Load per-batter-per-game batted ball data from the statcast_batted_balls table.
+    Returns a DataFrame with team_id mapped from MLB abbreviations.
+    """
+    try:
+        bb = pd.read_sql("SELECT * FROM statcast_batted_balls", conn)
+    except Exception:
+        return pd.DataFrame()
+
+    if bb.empty:
+        return bb
+
+    # Map team abbreviation → team_id
+    bb["team_id"] = bb["team"].map(MLB_ABBREV_TO_TEAM_ID)
+    bb["game_date"] = pd.to_datetime(bb["game_date"])
+
+    return bb
+
+
+def compute_statcast_batted_ball_features(bb_df, games_df, window=14):
+    """
+    Compute team-level rolling batted ball quality features from Statcast data.
+
+    For each team, computes 14-game trailing averages of:
+      - barrel_pct: % of BIP that are barrels (EV >= 98, optimal LA)
+      - pulled_air_pct: % of BIP that are pulled + in the air (LA > 10)
+      - pulled_barrel_pct: % of BIP that are pulled barrels (the "damage" signal)
+
+    Uses BIP-weighted team averages per game, then rolling mean.
+    """
+    if bb_df.empty:
+        print("  No Statcast batted ball data — skipping")
+        return pd.DataFrame()
+
+    # Aggregate to team-game level (sum across all batters)
+    team_game = bb_df.groupby(["game_date", "team_id"]).agg(
+        total_bip=("bip", "sum"),
+        total_barrels=("barrels", "sum"),
+        total_pulled_air=("pulled_air", "sum"),
+        total_pulled_barrels=("pulled_barrels", "sum"),
+    ).reset_index()
+
+    # Compute rates
+    team_game["barrel_pct"] = team_game["total_barrels"] / team_game["total_bip"].clip(lower=1)
+    team_game["pulled_air_pct"] = team_game["total_pulled_air"] / team_game["total_bip"].clip(lower=1)
+    team_game["pulled_barrel_pct"] = team_game["total_pulled_barrels"] / team_game["total_bip"].clip(lower=1)
+
+    team_game = team_game.sort_values(["team_id", "game_date"])
+
+    # Compute rolling averages (shifted by 1 to avoid leakage — only use past games)
+    results = []
+    for team_id, group in team_game.groupby("team_id"):
+        group = group.reset_index(drop=True)
+
+        for col in ["barrel_pct", "pulled_air_pct", "pulled_barrel_pct"]:
+            group[f"{col}_t{window}"] = (
+                group[col].shift(1)
+                .rolling(window=window, min_periods=3).mean()
+            )
+
+        results.append(group[["game_date", "team_id",
+                              f"barrel_pct_t{window}",
+                              f"pulled_air_pct_t{window}",
+                              f"pulled_barrel_pct_t{window}"]])
+
+    rolling_df = pd.concat(results, ignore_index=True)
+
+    # Now match to games — each game has a home and away team
+    # We need to find which game_id corresponds to each (game_date, team_id) pair
+    game_results = []
+    for _, game in games_df.iterrows():
+        game_id = game["game_id"]
+        game_date = pd.to_datetime(game["date"])
+        row = {"game_id": game_id}
+
+        for side in ["home", "away"]:
+            team_id = game[f"{side}_team_id"]
+            match = rolling_df[
+                (rolling_df["team_id"] == team_id) &
+                (rolling_df["game_date"] == game_date)
+            ]
+
+            for metric in ["barrel_pct", "pulled_air_pct", "pulled_barrel_pct"]:
+                col = f"{metric}_t{window}"
+                if len(match) > 0 and match.iloc[0][col] is not None:
+                    row[f"{side}_{col}"] = match.iloc[0][col]
+                else:
+                    row[f"{side}_{col}"] = np.nan
+
+        game_results.append(row)
+
+    result_df = pd.DataFrame(game_results)
+    n_valid = result_df[f"home_barrel_pct_t{window}"].notna().sum()
+    print(f"  Statcast batted ball features: {n_valid}/{len(result_df)} games with data")
+    return result_df
+
+
+# ═══════════════════════════════════════════════════════════════
 # LAYER 6a: REST DAYS (computed from game dates)
 # ═══════════════════════════════════════════════════════════════
 #
@@ -1644,7 +1797,8 @@ def assemble_game_features(games_df, team_features, sp_features, bp_features,
                            venue_splits_df=None, team_proj_features=None,
                            elo_df=None, bp_avail_features=None,
                            sp_rgs_features=None, weather_features=None,
-                           def_eff_features=None, barrel_features=None):
+                           def_eff_features=None, barrel_features=None,
+                           statcast_bb_features=None):
     """Merge all feature layers into a single game-level matrix."""
 
     result = games_df[["game_id", "mlb_game_id", "date", "season",
@@ -1790,6 +1944,14 @@ def assemble_game_features(games_df, team_features, sp_features, bp_features,
         br_cols = [c for c in barrel_features.columns if c != 'game_id']
         result = result.merge(
             barrel_features[['game_id'] + br_cols],
+            on='game_id', how='left'
+        )
+
+    # --- Statcast batted ball quality (barrel %, pulled air %, pulled barrel %) ---
+    if statcast_bb_features is not None and len(statcast_bb_features) > 0:
+        sbb_cols = [c for c in statcast_bb_features.columns if c != 'game_id']
+        result = result.merge(
+            statcast_bb_features[['game_id'] + sbb_cols],
             on='game_id', how='left'
         )
 
@@ -2025,6 +2187,18 @@ def main():
     except Exception as e:
         print(f"  Team barrel rate skipped: {e}")
 
+    # Layer 8c: Statcast batted ball quality (barrels, pulled air, pulled barrels)
+    statcast_bb_features = None
+    print("\n[13b/16] Computing Statcast batted ball features (Layer 8c)...")
+    try:
+        bb_data = load_statcast_batted_balls(conn)
+        if not bb_data.empty:
+            statcast_bb_features = compute_statcast_batted_ball_features(bb_data, games)
+        else:
+            print("  No Statcast batted ball data (run backfill_statcast_batted_balls.py)")
+    except Exception as e:
+        print(f"  Statcast batted ball features skipped: {e}")
+
     # Layer 7: Weather & park factor features
     weather_features = None
     print("\n[14/16] Computing weather & park factor features (Layer 7)...")
@@ -2058,7 +2232,8 @@ def main():
         rest_days_df, handedness_df, venue_splits_df,
         team_proj_features, elo_df, bp_avail_features,
         sp_rgs_features, weather_features,
-        def_eff_features, barrel_features
+        def_eff_features, barrel_features,
+        statcast_bb_features
     )
     
     if args.season:

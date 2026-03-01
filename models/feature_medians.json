@@ -45,5 +45,6 @@
   "away_sp_rgs": 53.47713043478261,
   "diff_sp_rgs": 0.03531609195401935,
   "park_factor_runs": 1.0,
-  "park_factor_hr": 0.99
+  "park_factor_hr": 1.0,
+  "ball_flight_index": 6.18
 }

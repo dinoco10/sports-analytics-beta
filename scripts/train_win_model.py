@@ -62,12 +62,13 @@ MODELS_DIR = Path(__file__).parent.parent / "models"
 # ===================================================================
 # PRUNED FEATURE SET — 47 features, curated by ablation
 # ===================================================================
-# 42 base + 2 Elo + 3 SP Game Score (538 rGS) - 2 pruned noise + 2 park = 47.
-# Log loss: 0.6670 (5-seed avg).
-# rGS adds -4bp; pruning 3 noisy features saves -3bp; park factors -2.5bp.
+# 42 base + 2 Elo + 3 SP Game Score (538 rGS) - 2 pruned noise + 2 park + 1 weather = 48.
+# Log loss: 0.6667 (5-seed avg).
+# rGS adds -4bp; pruning 3 noisy features saves -3bp; park factors -2.5bp; BFI -5.7bp.
 # Dropped: home_proj_sp_war (<1bp), diff_venue_wpct (-1.4bp noise),
 #          home_ivb_x_same_hand (-2.8bp noise).
 # Tested & rejected: def_eff (+9.1bp diff, -1.6bp h/a — not worth complexity).
+# Tested & rejected: game_temperature (+1.9bp alone; -4.2bp with BFI but dilutes signal).
 
 PRUNED_FEATURES = [
     # Projections (strongest signal)
@@ -130,6 +131,9 @@ PRUNED_FEATURES = [
     # Ablation: both runs+HR = -2.5bp; runs alone = noise
     "park_factor_runs",
     "park_factor_hr",
+    # Weather composite (physics-based ball flight distance index, 1-10 scale)
+    # Ablation: BFI alone = -5.7bp; raw temp hurts (+1.9bp); BFI pre-computes the physics
+    "ball_flight_index",
 ]
 
 def get_feature_layers():
