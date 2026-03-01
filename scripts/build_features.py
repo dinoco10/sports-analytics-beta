@@ -21,6 +21,7 @@ Author: Loko
 
 import argparse
 import sqlite3
+import sys
 import warnings
 from pathlib import Path
 
@@ -103,7 +104,7 @@ def get_db_connection():
 
 def load_games(conn):
     query = """
-    SELECT 
+    SELECT
         id AS game_id,
         mlb_game_id,
         date,
@@ -116,7 +117,12 @@ def load_games(conn):
         away_score,
         day_night,
         home_rest_days,
-        away_rest_days
+        away_rest_days,
+        temperature_f,
+        wind_speed_mph,
+        wind_direction,
+        is_dome,
+        ballpark_id
     FROM games
     WHERE home_score IS NOT NULL
     ORDER BY date, id
@@ -126,6 +132,16 @@ def load_games(conn):
     df["home_win"] = (df["home_score"] > df["away_score"]).astype(int)
     df["total_runs"] = df["home_score"] + df["away_score"]
     return df
+
+
+def load_ballparks(conn):
+    """Load ballpark data for park factor features."""
+    query = """
+    SELECT id, name, team_id, park_factor, park_factor_hr,
+           park_factor_lhb, park_factor_rhb, elevation_ft, is_dome
+    FROM ballparks
+    """
+    return pd.read_sql(query, conn)
 
 
 def load_pitching_stats(conn):
@@ -406,6 +422,158 @@ def compute_pitcher_rolling(pitching_df, windows=SP_WINDOWS):
 
 
 # ═══════════════════════════════════════════════════════════════
+# LAYER 2b: STARTING PITCHER ROLLING GAME SCORE (538 rGS)
+# ═══════════════════════════════════════════════════════════════
+#
+# FiveThirtyEight's single largest pregame signal. Game Score formula
+# from Tangotiger (modified): captures SP quality in one number.
+# We compute per-pitcher rolling avg game score, then team avg,
+# and feed both into game features as home_sp_rgs, away_sp_rgs, diff_sp_rgs.
+
+def game_score(ip, k, bb, h, r, hr):
+    """538-style Game Score for a single start.
+
+    Formula: 47.4 + (outs * 1.5) + K - (BB * 2) - (H * 2) - (R * 3) - (HR * 4)
+    Average is ~50; elite aces sustain 60-65+.
+    """
+    # ip is decimal (6.1 = 6 and 1/3 innings)
+    full_innings = int(ip) if pd.notna(ip) else 0
+    partial = round((ip % 1) * 10) if pd.notna(ip) else 0
+    outs = full_innings * 3 + partial
+
+    k = k if pd.notna(k) else 0
+    bb = bb if pd.notna(bb) else 0
+    h = h if pd.notna(h) else 0
+    r = r if pd.notna(r) else 0
+    hr = hr if pd.notna(hr) else 0
+
+    return 47.4 + (outs * 1.5) + k - (bb * 2) - (h * 2) - (r * 3) - (hr * 4)
+
+
+SP_RGS_DEFAULT = 50.0   # League-average game score
+SP_RGS_MIN_STARTS = 3   # Minimum starts before trusting raw rGS
+SP_RGS_WINDOW = 10       # Rolling window (starts, not days)
+
+
+def compute_sp_game_score(pitching_df, games_df):
+    """Compute rolling Game Score (rGS) per starting pitcher, plus team avg rGS.
+
+    Returns DataFrame with columns: game_id, home_sp_rgs, away_sp_rgs, diff_sp_rgs,
+    home_team_rgs, away_team_rgs (team averages for pitcher_adj calculation).
+
+    The 538 pitcher adjustment is: 4.7 * (pitcher_rGS - team_rGS).
+    An ace 10 GS above team avg adds 47 Elo points (~7% win prob shift).
+    """
+    starters = pitching_df[pitching_df["is_starter"]].copy()
+    starters = starters.sort_values(["player_id", "date", "game_id"])
+
+    print(f"  Computing Game Score for {starters['player_id'].nunique()} starters...")
+
+    # Step 1: Compute raw game score for each start
+    starters["gs_raw"] = [
+        game_score(ip, k, bb, h, r, hr)
+        for ip, k, bb, h, r, hr in zip(
+            starters["ip_decimal"], starters["strikeouts"], starters["walks"],
+            starters["hits"], starters["runs"], starters["home_runs"]
+        )
+    ]
+
+    # Step 2: Rolling average per pitcher (shifted so it's pre-game, not post-game)
+    all_sp = []
+    for player_id, group in starters.groupby("player_id"):
+        group = group.reset_index(drop=True)
+
+        # shift(1) makes it purely pre-game (uses only prior starts)
+        rolled = group["gs_raw"].shift(1).rolling(
+            window=SP_RGS_WINDOW, min_periods=1
+        ).mean()
+
+        # Count prior starts for regression
+        n_prior = group["gs_raw"].shift(1).expanding().count()
+
+        # Regress toward league average when few starts available
+        # Weight: n_prior / (n_prior + SP_RGS_MIN_STARTS)
+        weight = n_prior / (n_prior + SP_RGS_MIN_STARTS)
+        group["sp_rgs"] = weight * rolled + (1 - weight) * SP_RGS_DEFAULT
+
+        all_sp.append(group[["game_id", "player_id", "team_id", "date", "sp_rgs", "gs_raw"]])
+
+    sp_rgs = pd.concat(all_sp, ignore_index=True)
+
+    # Step 3: Team average rGS (rolling avg of all starters on the team)
+    # This is needed for the pitcher_adj formula: 4.7 * (pitcher_rGS - team_rGS)
+    sp_rgs = sp_rgs.sort_values(["team_id", "date", "game_id"])
+
+    team_rgs_parts = []
+    for team_id, tgroup in sp_rgs.groupby("team_id"):
+        tgroup = tgroup.reset_index(drop=True)
+        # Team avg rGS from last N starts across all SPs (shifted pre-game)
+        team_rolled = tgroup["gs_raw"].shift(1).rolling(
+            window=SP_RGS_WINDOW * 5, min_periods=3  # ~50 team starts = full rotation
+        ).mean()
+
+        n_team = tgroup["gs_raw"].shift(1).expanding().count()
+        tw = n_team / (n_team + 10)  # Regress more heavily for team avg
+        tgroup["team_rgs"] = tw * team_rolled + (1 - tw) * SP_RGS_DEFAULT
+
+        team_rgs_parts.append(tgroup[["game_id", "player_id", "team_id", "sp_rgs", "team_rgs"]])
+
+    sp_rgs_full = pd.concat(team_rgs_parts, ignore_index=True)
+
+    # Step 4: Map to game-level features (home/away)
+    sp_rgs_full = sp_rgs_full.merge(
+        games_df[["game_id", "home_team_id", "away_team_id"]],
+        on="game_id", how="left"
+    )
+
+    # Home SP rGS
+    home_sp = sp_rgs_full[sp_rgs_full["team_id"] == sp_rgs_full["home_team_id"]].copy()
+    home_sp = home_sp.drop_duplicates(subset=["game_id"], keep="first")
+    home_sp = home_sp.rename(columns={
+        "sp_rgs": "home_sp_rgs",
+        "team_rgs": "home_team_rgs"
+    })
+
+    # Away SP rGS
+    away_sp = sp_rgs_full[sp_rgs_full["team_id"] == sp_rgs_full["away_team_id"]].copy()
+    away_sp = away_sp.drop_duplicates(subset=["game_id"], keep="first")
+    away_sp = away_sp.rename(columns={
+        "sp_rgs": "away_sp_rgs",
+        "team_rgs": "away_team_rgs"
+    })
+
+    # Merge home + away into game-level DF
+    result = games_df[["game_id"]].drop_duplicates().merge(
+        home_sp[["game_id", "home_sp_rgs", "home_team_rgs"]],
+        on="game_id", how="left"
+    ).merge(
+        away_sp[["game_id", "away_sp_rgs", "away_team_rgs"]],
+        on="game_id", how="left"
+    )
+
+    # Fill missing (openers, unknown starters) with league avg
+    for col in ["home_sp_rgs", "away_sp_rgs", "home_team_rgs", "away_team_rgs"]:
+        result[col] = result[col].fillna(SP_RGS_DEFAULT)
+
+    # Diff features
+    result["diff_sp_rgs"] = result["home_sp_rgs"] - result["away_sp_rgs"]
+
+    # 538 pitcher adjustment: how much this SP lifts/drags team rating
+    # pitcher_adj = 4.7 * (pitcher_rGS - team_rGS)
+    result["home_sp_rgs_adj"] = 4.7 * (result["home_sp_rgs"] - result["home_team_rgs"])
+    result["away_sp_rgs_adj"] = 4.7 * (result["away_sp_rgs"] - result["away_team_rgs"])
+    result["diff_sp_rgs_adj"] = result["home_sp_rgs_adj"] - result["away_sp_rgs_adj"]
+
+    coverage = result["home_sp_rgs"].notna().sum()
+    print(f"  Game Score features: {coverage}/{len(result)} games covered")
+    print(f"  Home SP rGS: mean={result['home_sp_rgs'].mean():.1f}, std={result['home_sp_rgs'].std():.1f}")
+    print(f"  Away SP rGS: mean={result['away_sp_rgs'].mean():.1f}, std={result['away_sp_rgs'].std():.1f}")
+    print(f"  SP adj range: [{result['home_sp_rgs_adj'].min():.1f}, {result['home_sp_rgs_adj'].max():.1f}] Elo points")
+
+    return result
+
+
+# ═══════════════════════════════════════════════════════════════
 # LAYER 3: BULLPEN (team total minus starter)
 # ═══════════════════════════════════════════════════════════════
 
@@ -478,6 +646,104 @@ def compute_bullpen_rolling(pitching_df, games_df, windows=BP_WINDOWS):
         if any(c.startswith(p) for p in ["bp_era", "bp_whip", "bp_k_pct", "bp_bb_pct"])
     ]
     return result[feature_cols]
+
+
+# ═══════════════════════════════════════════════════════════════
+# LAYER 3b: BULLPEN AVAILABILITY (fatigue / workload)
+# ═══════════════════════════════════════════════════════════════
+
+def compute_bullpen_availability(pitching_df, games_df):
+    """
+    Compute bullpen workload/availability features.
+
+    For each team before each game, compute:
+    - bp_ip_last1/2/3: total reliever IP in last 1/2/3 team games
+    - bp_pitches_last1/2/3: total reliever pitches in last 1/2/3 team games
+    - bp_high_lev_unavail: number of top relievers (by IP) who pitched back-to-back
+
+    These capture whether a team's bullpen is fresh or gassed —
+    information that no projection or rolling average captures.
+    """
+    # Identify relievers: anyone who pitched but wasn't the starter
+    relievers = pitching_df[~pitching_df["is_starter"]].copy()
+    if relievers.empty:
+        return pd.DataFrame()
+
+    # Aggregate reliever workload per team per game
+    bp_game = (
+        relievers.groupby(["game_id", "team_id"])
+        .agg(
+            bp_ip=("ip_decimal", "sum"),
+            bp_pitches=("pitches", "sum"),
+            n_relievers=("player_id", "nunique"),
+        )
+        .reset_index()
+    )
+
+    # Merge dates
+    bp_game = bp_game.merge(
+        games_df[["game_id", "date", "season"]],
+        on="game_id", how="left"
+    )
+    bp_game = bp_game.sort_values(["team_id", "date", "game_id"])
+
+    # Compute rolling workload over last 1/2/3 games (shift(1) = pre-game)
+    results = []
+    for team_id, group in bp_game.groupby("team_id"):
+        group = group.copy()
+
+        for window in [1, 2, 3]:
+            group[f"bp_ip_last{window}"] = (
+                group["bp_ip"].shift(1).rolling(window, min_periods=1).sum()
+            )
+            group[f"bp_pitches_last{window}"] = (
+                group["bp_pitches"].shift(1).rolling(window, min_periods=1).sum()
+            )
+            group[f"bp_relievers_last{window}"] = (
+                group["n_relievers"].shift(1).rolling(window, min_periods=1).sum()
+            )
+
+        results.append(group)
+
+    bp_avail = pd.concat(results, ignore_index=True)
+
+    # Now build game-level features (home and away)
+    game_results = []
+    for _, game in games_df.iterrows():
+        game_id = game["game_id"]
+        row = {"game_id": game_id}
+
+        for side in ["home", "away"]:
+            team_id = game[f"{side}_team_id"]
+            team_bp = bp_avail[
+                (bp_avail["game_id"] == game_id) & (bp_avail["team_id"] == team_id)
+            ]
+
+            if len(team_bp) > 0:
+                t = team_bp.iloc[0]
+                for window in [1, 2, 3]:
+                    row[f"{side}_bp_ip_last{window}"] = t.get(f"bp_ip_last{window}", np.nan)
+                    row[f"{side}_bp_pitches_last{window}"] = t.get(f"bp_pitches_last{window}", np.nan)
+            else:
+                for window in [1, 2, 3]:
+                    row[f"{side}_bp_ip_last{window}"] = np.nan
+                    row[f"{side}_bp_pitches_last{window}"] = np.nan
+
+        # Diff features (higher = home bullpen more fatigued)
+        for window in [1, 2, 3]:
+            h_ip = row.get(f"home_bp_ip_last{window}", 0) or 0
+            a_ip = row.get(f"away_bp_ip_last{window}", 0) or 0
+            row[f"diff_bp_fatigue_last{window}"] = h_ip - a_ip
+
+        game_results.append(row)
+
+    result_df = pd.DataFrame(game_results)
+
+    # Stats
+    non_null = result_df["home_bp_ip_last1"].notna().sum()
+    print(f"  Bullpen availability for {non_null}/{len(result_df)} games")
+
+    return result_df
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -679,6 +945,318 @@ def compute_home_away_splits(games_df):
 
 
 # ═══════════════════════════════════════════════════════════════
+# LAYER 8: FEATURE GAPS (defensive efficiency, barrel rate)
+# ═══════════════════════════════════════════════════════════════
+#
+# These features fill known gaps identified by competitor model research:
+# 1. Team defensive efficiency (1 - BABIP allowed) — only major category missing
+# 2. Team rolling barrel rate — contact quality distinct from SLG
+
+DEFENSE_WINDOW = 30  # 30 games rolling
+
+def compute_defensive_efficiency(pitching_df, games_df, hitting_df):
+    """
+    Compute team defensive efficiency: 1 - BABIP allowed.
+
+    BABIP = (H - HR) / (BF - K - HR - SF)
+    Defensive efficiency = 1 - BABIP = fraction of BIP converted to outs.
+
+    This is the only major feature category completely missing from our model.
+    Better defenses convert more balls in play to outs → fewer runs.
+    """
+    # Aggregate team pitching per game
+    team_pitch = (
+        pitching_df.groupby(["game_id", "team_id"])
+        .agg(
+            team_h=("hits", "sum"),
+            team_hr=("home_runs", "sum"),
+            team_so=("strikeouts", "sum"),
+            team_ip=("ip_decimal", "sum"),
+            team_bb=("walks", "sum"),
+        )
+        .reset_index()
+    )
+
+    # Approximate BF from IP and components
+    team_pitch["bf_approx"] = team_pitch["team_ip"] * 3 + team_pitch["team_h"] + team_pitch["team_bb"]
+
+    # BABIP = (H - HR) / (BF - K - HR)
+    denom = team_pitch["bf_approx"] - team_pitch["team_so"] - team_pitch["team_hr"]
+    team_pitch["babip"] = (team_pitch["team_h"] - team_pitch["team_hr"]) / denom.clip(lower=1)
+    team_pitch["babip"] = team_pitch["babip"].clip(0, 1)
+
+    # Merge dates
+    team_pitch = team_pitch.merge(
+        games_df[["game_id", "date"]], on="game_id", how="left"
+    )
+    team_pitch = team_pitch.sort_values(["team_id", "date", "game_id"])
+
+    # Rolling BABIP → defensive efficiency
+    results = []
+    for team_id, group in team_pitch.groupby("team_id"):
+        group = group.reset_index(drop=True)
+
+        rolling_babip = (
+            group["babip"].shift(1)
+            .rolling(window=DEFENSE_WINDOW, min_periods=5).mean()
+        )
+        group["def_eff"] = 1.0 - rolling_babip
+
+        results.append(group[["game_id", "team_id", "def_eff"]])
+
+    def_df = pd.concat(results, ignore_index=True)
+
+    # Pivot to game-level (home/away)
+    game_results = []
+    for _, game in games_df.iterrows():
+        game_id = game["game_id"]
+        row = {"game_id": game_id}
+
+        for side in ["home", "away"]:
+            team_id = game[f"{side}_team_id"]
+            team_def = def_df[(def_df["game_id"] == game_id) & (def_df["team_id"] == team_id)]
+
+            if len(team_def) > 0:
+                row[f"{side}_def_eff"] = team_def.iloc[0]["def_eff"]
+            else:
+                row[f"{side}_def_eff"] = np.nan
+
+        row["diff_def_eff"] = (row.get("home_def_eff") or 0) - (row.get("away_def_eff") or 0)
+        game_results.append(row)
+
+    result_df = pd.DataFrame(game_results)
+    n_valid = result_df["home_def_eff"].notna().sum()
+    print(f"  Defensive efficiency for {n_valid}/{len(result_df)} games")
+    return result_df
+
+
+def compute_team_barrel_rate(hitting_df, games_df):
+    """
+    Compute team rolling barrel rate as a contact quality signal.
+
+    Barrel rate captures hard contact quality distinct from SLG.
+    Source: hitting_game_stats.barrel_pct (where available from Statcast).
+
+    Note: barrel_pct is per-player per-game. We need team averages
+    weighted by plate appearances.
+    """
+    # Check if barrel_pct exists and is populated
+    if "barrel_pct" not in hitting_df.columns:
+        print("  barrel_pct not in hitting stats — skipping")
+        return pd.DataFrame()
+
+    # Filter to rows with barrel data
+    with_barrel = hitting_df[hitting_df.get("barrel_pct", pd.Series()).notna()].copy()
+    if len(with_barrel) < 100:
+        print(f"  Only {len(with_barrel)} games with barrel data — skipping")
+        return pd.DataFrame()
+
+    # Team average barrel rate per game (PA-weighted)
+    team_barrel = (
+        with_barrel.groupby(["game_id", "team_id"])
+        .apply(lambda g: np.average(g["barrel_pct"], weights=g.get("plate_appearances", 1))
+               if len(g) > 0 else np.nan, include_groups=False)
+        .reset_index(name="team_barrel_pct")
+    )
+
+    team_barrel = team_barrel.merge(
+        games_df[["game_id", "date"]], on="game_id", how="left"
+    )
+    team_barrel = team_barrel.sort_values(["team_id", "date", "game_id"])
+
+    results = []
+    for team_id, group in team_barrel.groupby("team_id"):
+        group = group.reset_index(drop=True)
+
+        rolling = (
+            group["team_barrel_pct"].shift(1)
+            .rolling(window=14, min_periods=3).mean()
+        )
+        group["team_barrel_t14"] = rolling
+        results.append(group[["game_id", "team_id", "team_barrel_t14"]])
+
+    barrel_df = pd.concat(results, ignore_index=True)
+
+    # Pivot to game-level
+    game_results = []
+    for _, game in games_df.iterrows():
+        game_id = game["game_id"]
+        row = {"game_id": game_id}
+
+        for side in ["home", "away"]:
+            team_id = game[f"{side}_team_id"]
+            tb = barrel_df[(barrel_df["game_id"] == game_id) & (barrel_df["team_id"] == team_id)]
+
+            if len(tb) > 0:
+                row[f"{side}_team_barrel_t14"] = tb.iloc[0]["team_barrel_t14"]
+            else:
+                row[f"{side}_team_barrel_t14"] = np.nan
+
+        hb = row.get("home_team_barrel_t14")
+        ab = row.get("away_team_barrel_t14")
+        row["diff_team_barrel_t14"] = (hb if hb else 0) - (ab if ab else 0)
+        game_results.append(row)
+
+    result_df = pd.DataFrame(game_results)
+    n_valid = result_df["home_team_barrel_t14"].notna().sum()
+    print(f"  Team barrel rate for {n_valid}/{len(result_df)} games")
+    return result_df
+
+
+# ═══════════════════════════════════════════════════════════════
+# LAYER 8c: STATCAST BATTED BALL QUALITY
+# ═══════════════════════════════════════════════════════════════
+#
+# Per-game batted ball quality from the statcast_batted_balls table
+# (populated by backfill_statcast_batted_balls.py via pybaseball).
+#
+# Features: team rolling barrel %, pulled air %, pulled barrel %
+# These capture quality-of-contact trends better than SLG alone.
+# Pulled barrels = the "damage" metric (extra-base hits + HRs).
+
+# MLB team abbreviation → DB team_id mapping
+# The statcast_batted_balls table uses MLB abbreviations (NYY, BOS, etc.)
+# but our games table uses integer team_ids.
+MLB_ABBREV_TO_TEAM_ID = {
+    # DB IDs from teams table (id, name):
+    # 1=Athletics, 2=Pirates, 3=Padres, 4=Mariners, 5=Giants, 6=Cardinals,
+    # 7=Rays, 8=Rangers, 9=Blue Jays, 10=Twins, 11=Phillies, 12=Braves,
+    # 13=White Sox, 14=Marlins, 15=Yankees, 16=Brewers, 17=Angels,
+    # 18=Diamondbacks, 19=Orioles, 20=Red Sox, 21=Cubs, 22=Reds,
+    # 23=Guardians, 24=Rockies, 25=Tigers, 26=Astros, 27=Royals,
+    # 28=Dodgers, 29=Nationals, 30=Mets
+    "OAK": 1, "ATH": 1,
+    "PIT": 2,
+    "SD": 3, "SDP": 3,
+    "SEA": 4,
+    "SF": 5, "SFG": 5,
+    "STL": 6,
+    "TB": 7, "TBR": 7,
+    "TEX": 8,
+    "TOR": 9,
+    "MIN": 10,
+    "PHI": 11,
+    "ATL": 12,
+    "CWS": 13, "CHW": 13,
+    "MIA": 14,
+    "NYY": 15,
+    "MIL": 16,
+    "LAA": 17,
+    "ARI": 18, "AZ": 18,
+    "BAL": 19,
+    "BOS": 20,
+    "CHC": 21,
+    "CIN": 22,
+    "CLE": 23,
+    "COL": 24,
+    "DET": 25,
+    "HOU": 26,
+    "KC": 27, "KCR": 27,
+    "LAD": 28,
+    "WSH": 29, "WSN": 29,
+    "NYM": 30,
+}
+
+
+def load_statcast_batted_balls(conn):
+    """
+    Load per-batter-per-game batted ball data from the statcast_batted_balls table.
+    Returns a DataFrame with team_id mapped from MLB abbreviations.
+    """
+    try:
+        bb = pd.read_sql("SELECT * FROM statcast_batted_balls", conn)
+    except Exception:
+        return pd.DataFrame()
+
+    if bb.empty:
+        return bb
+
+    # Map team abbreviation → team_id
+    bb["team_id"] = bb["team"].map(MLB_ABBREV_TO_TEAM_ID)
+    bb["game_date"] = pd.to_datetime(bb["game_date"])
+
+    return bb
+
+
+def compute_statcast_batted_ball_features(bb_df, games_df, window=14):
+    """
+    Compute team-level rolling batted ball quality features from Statcast data.
+
+    For each team, computes 14-game trailing averages of:
+      - barrel_pct: % of BIP that are barrels (EV >= 98, optimal LA)
+      - pulled_air_pct: % of BIP that are pulled + in the air (LA > 10)
+      - pulled_barrel_pct: % of BIP that are pulled barrels (the "damage" signal)
+
+    Uses BIP-weighted team averages per game, then rolling mean.
+    """
+    if bb_df.empty:
+        print("  No Statcast batted ball data — skipping")
+        return pd.DataFrame()
+
+    # Aggregate to team-game level (sum across all batters)
+    team_game = bb_df.groupby(["game_date", "team_id"]).agg(
+        total_bip=("bip", "sum"),
+        total_barrels=("barrels", "sum"),
+        total_pulled_air=("pulled_air", "sum"),
+        total_pulled_barrels=("pulled_barrels", "sum"),
+    ).reset_index()
+
+    # Compute rates
+    team_game["barrel_pct"] = team_game["total_barrels"] / team_game["total_bip"].clip(lower=1)
+    team_game["pulled_air_pct"] = team_game["total_pulled_air"] / team_game["total_bip"].clip(lower=1)
+    team_game["pulled_barrel_pct"] = team_game["total_pulled_barrels"] / team_game["total_bip"].clip(lower=1)
+
+    team_game = team_game.sort_values(["team_id", "game_date"])
+
+    # Compute rolling averages (shifted by 1 to avoid leakage — only use past games)
+    results = []
+    for team_id, group in team_game.groupby("team_id"):
+        group = group.reset_index(drop=True)
+
+        for col in ["barrel_pct", "pulled_air_pct", "pulled_barrel_pct"]:
+            group[f"{col}_t{window}"] = (
+                group[col].shift(1)
+                .rolling(window=window, min_periods=3).mean()
+            )
+
+        results.append(group[["game_date", "team_id",
+                              f"barrel_pct_t{window}",
+                              f"pulled_air_pct_t{window}",
+                              f"pulled_barrel_pct_t{window}"]])
+
+    rolling_df = pd.concat(results, ignore_index=True)
+
+    # Now match to games — each game has a home and away team
+    # We need to find which game_id corresponds to each (game_date, team_id) pair
+    game_results = []
+    for _, game in games_df.iterrows():
+        game_id = game["game_id"]
+        game_date = pd.to_datetime(game["date"])
+        row = {"game_id": game_id}
+
+        for side in ["home", "away"]:
+            team_id = game[f"{side}_team_id"]
+            match = rolling_df[
+                (rolling_df["team_id"] == team_id) &
+                (rolling_df["game_date"] == game_date)
+            ]
+
+            for metric in ["barrel_pct", "pulled_air_pct", "pulled_barrel_pct"]:
+                col = f"{metric}_t{window}"
+                if len(match) > 0 and match.iloc[0][col] is not None:
+                    row[f"{side}_{col}"] = match.iloc[0][col]
+                else:
+                    row[f"{side}_{col}"] = np.nan
+
+        game_results.append(row)
+
+    result_df = pd.DataFrame(game_results)
+    n_valid = result_df[f"home_barrel_pct_t{window}"].notna().sum()
+    print(f"  Statcast batted ball features: {n_valid}/{len(result_df)} games with data")
+    return result_df
+
+
+# ═══════════════════════════════════════════════════════════════
 # LAYER 6a: REST DAYS (computed from game dates)
 # ═══════════════════════════════════════════════════════════════
 #
@@ -846,59 +1424,84 @@ def compute_handedness_features(games_df, hitting_df, conn):
 
 def load_projection_maps():
     """
-    Load pitcher and hitter projections from CSV into lookup dicts.
+    Load Marcel projection snapshots for each season into lookup dicts.
+
+    Uses frozen snapshots from data/features/snapshots/ to prevent lookahead
+    bias: 2023 games get 2023 projections (built from 2021-2022 data only),
+    2024 games get 2024 projections, etc.
+
+    Falls back to the production 2026 CSVs for any season without a snapshot.
+
     Returns:
-        pitcher_map: mlb_player_id -> {proj_war, proj_fip, proj_era}
-        hitter_map:  mlb_player_id -> {statcast_adjusted_woba, wrc_plus,
-                                        bounce_back_score, proj_war}
+        pitcher_maps: {season: {mlb_player_id: {...}}}
+        hitter_maps:  {season: {mlb_player_id: {...}}}
     """
-    proj_dir = OUTPUT_DIR  # data/features/
+    snapshot_dir = OUTPUT_DIR / "snapshots"
+    proj_dir = OUTPUT_DIR
 
-    pitcher_map = {}
-    hitter_map = {}
+    pitcher_maps = {}
+    hitter_maps = {}
 
-    pitcher_path = proj_dir / "pitcher_projections_2026.csv"
-    if pitcher_path.exists():
-        p_df = pd.read_csv(pitcher_path)
-        for _, row in p_df.iterrows():
-            pitcher_map[row['mlb_player_id']] = {
-                'proj_war': row.get('proj_war', 0),
-                'proj_fip': row.get('proj_fip', 4.20),
-                'proj_era': row.get('proj_era', 4.20),
-                'statcast_adjusted_era': row.get('statcast_adjusted_era', row.get('proj_era', 4.20)),
-                'sustainability_score': row.get('sustainability_score', 50),
-                'breakout_score': row.get('breakout_score', 50),
-                'proj_k_bb_pct': row.get('proj_k_bb_pct', 10.0),
-                'proj_arsenal_depth': row.get('proj_arsenal_depth', 1.5),
-                'proj_fb_velocity': row.get('proj_fb_velocity', 93.9),
-                'proj_fb_ivb': row.get('proj_fb_ivb', 12.8),
-            }
-        print(f"    Loaded {len(pitcher_map)} pitcher projections")
-    else:
-        print(f"    WARNING: {pitcher_path} not found. Run player_projections first.")
+    # Snapshot seasons: each game year maps to its projection year
+    # Games in 2023 use the 2023 Marcel snapshot (built from 2021-2022 data)
+    snapshot_years = [2023, 2024, 2025, 2026]
 
-    hitter_path = proj_dir / "hitter_projections_2026.csv"
-    if hitter_path.exists():
-        h_df = pd.read_csv(hitter_path)
-        for _, row in h_df.iterrows():
-            hitter_map[row['mlb_player_id']] = {
-                'sc_woba': row.get('statcast_adjusted_woba', 0.310),
-                'wrc_plus': row.get('wrc_plus', 100),
-                'bounce_back': row.get('bounce_back_score', 50),
-                'proj_war': row.get('proj_war', 0),
-            }
-        print(f"    Loaded {len(hitter_map)} hitter projections")
-    else:
-        print(f"    WARNING: {hitter_path} not found. Run player_projections first.")
+    for year in snapshot_years:
+        pitcher_map = {}
+        hitter_map = {}
 
-    return pitcher_map, hitter_map
+        # Try snapshot first, fall back to production CSVs for 2026
+        p_path = snapshot_dir / f"marcel_pitchers_{year}.csv"
+        if not p_path.exists() and year == 2026:
+            p_path = proj_dir / "pitcher_projections_2026.csv"
+        h_path = snapshot_dir / f"marcel_hitters_{year}.csv"
+        if not h_path.exists() and year == 2026:
+            h_path = proj_dir / "hitter_projections_2026.csv"
+
+        if p_path.exists():
+            p_df = pd.read_csv(p_path)
+            for _, row in p_df.iterrows():
+                pitcher_map[row['mlb_player_id']] = {
+                    'proj_war': row.get('proj_war', 0),
+                    'proj_fip': row.get('proj_fip', 4.20),
+                    'proj_era': row.get('proj_era', 4.20),
+                    'statcast_adjusted_era': row.get('statcast_adjusted_era',
+                                                     row.get('proj_era', 4.20)),
+                    'sustainability_score': row.get('sustainability_score', 50),
+                    'breakout_score': row.get('breakout_score', 50),
+                    'proj_k_bb_pct': row.get('proj_k_bb_pct',
+                                             row.get('proj_k_pct', 20) - row.get('proj_bb_pct', 10)
+                                             if 'proj_k_pct' in row.index else 10.0),
+                    'proj_arsenal_depth': row.get('proj_arsenal_depth', 1.5),
+                    'proj_fb_velocity': row.get('proj_fb_velocity', 93.9),
+                    'proj_fb_ivb': row.get('proj_fb_ivb', 12.8),
+                }
+
+        if h_path.exists():
+            h_df = pd.read_csv(h_path)
+            for _, row in h_df.iterrows():
+                hitter_map[row['mlb_player_id']] = {
+                    'sc_woba': row.get('statcast_adjusted_woba', 0.310),
+                    'wrc_plus': row.get('wrc_plus', 100),
+                    'bounce_back': row.get('bounce_back_score', 50),
+                    'proj_war': row.get('proj_war', 0),
+                }
+
+        pitcher_maps[year] = pitcher_map
+        hitter_maps[year] = hitter_map
+        print(f"    {year} snapshot: {len(pitcher_map)} pitchers, {len(hitter_map)} hitters")
+
+    return pitcher_maps, hitter_maps
 
 
-def compute_projection_features(games_df, hitting_df, pitcher_map, hitter_map):
+def compute_projection_features(games_df, hitting_df, pitcher_maps, hitter_maps):
     """
-    For each game, look up:
+    For each game, look up the correct season's Marcel snapshot and extract:
     1. Starting pitcher's projected fWAR and FIP
     2. Lineup's average statcast_adjusted_woba and bounce-back score
+
+    Uses season-keyed maps to prevent lookahead bias: 2023 games get
+    2023 projections (built from 2021-2022 data), not 2026 projections.
 
     Returns a DataFrame with one row per game, columns:
     - home_proj_sp_war, away_proj_sp_war (starter quality)
@@ -910,7 +1513,6 @@ def compute_projection_features(games_df, hitting_df, pitcher_map, hitter_map):
     results = []
 
     # Pre-compute: for each game, which hitters appeared for each team?
-    # Build a game_id -> {team_id: [player_ids]} mapping from hitting_df
     game_hitters = {}
     for _, row in hitting_df.iterrows():
         gid = row['game_id']
@@ -937,7 +1539,12 @@ def compute_projection_features(games_df, hitting_df, pitcher_map, hitter_map):
 
     for _, game in games_df.iterrows():
         game_id = game['game_id']
+        game_season = game['season']
         row = {'game_id': game_id}
+
+        # Pick the correct season's snapshot (2023 games → 2023 projections)
+        pitcher_map = pitcher_maps.get(game_season, pitcher_maps.get(2026, {}))
+        hitter_map = hitter_maps.get(game_season, hitter_maps.get(2026, {}))
 
         for side in ['home', 'away']:
             team_id = game[f'{side}_team_id']
@@ -961,7 +1568,6 @@ def compute_projection_features(games_df, hitting_df, pitcher_map, hitter_map):
             row[f'{side}_proj_sp_ivb'] = sp_proj['proj_fb_ivb']
 
             # --- Lineup projection ---
-            # Average statcast_adjusted_woba and bounce-back of hitters in this game
             hitter_pids = game_hitters.get(game_id, {}).get(team_id, [])
             wobas = []
             bb_scores = []
@@ -993,13 +1599,206 @@ def compute_projection_features(games_df, hitting_df, pitcher_map, hitter_map):
 
 
 # ═══════════════════════════════════════════════════════════════
+# ELO RATINGS
+# ═══════════════════════════════════════════════════════════════
+
+# Elo constants — tuned for MLB
+ELO_K = 4                # Update magnitude per game (MLB is low-variance)
+ELO_HOME_ADV = 24        # ~54% implied home win rate
+ELO_MEAN = 1500          # League average
+ELO_SEASON_REVERT = 0.33 # Regress 1/3 toward mean between seasons
+ELO_MOV_MULTIPLIER = True  # Scale K by margin of victory
+
+
+def _elo_expected(rating_a, rating_b):
+    """Expected win probability for team A given ratings."""
+    return 1.0 / (1.0 + 10.0 ** ((rating_b - rating_a) / 400.0))
+
+
+def _elo_mov_mult(mov, elo_diff):
+    """
+    Margin-of-victory multiplier (FiveThirtyEight formula).
+    Rewards blowouts slightly more, but diminishing returns.
+    Accounts for autocorrelation: winning team with higher Elo
+    gets less credit for running up the score.
+    """
+    if mov == 0:
+        return 1.0
+    return np.log(abs(mov) + 1) * (2.2 / ((elo_diff * 0.001) + 2.2))
+
+
+def compute_elo_ratings(games_df):
+    """
+    Compute running Elo ratings for all teams across all games.
+
+    Returns a DataFrame with game_id, home_elo, away_elo, diff_elo.
+    Elo values are PRE-GAME ratings (before the game result updates them).
+    Season boundaries trigger a regression toward the mean.
+
+    The Elo system captures team quality trajectory — something rolling
+    stats and static projections can't. It's orthogonal to both.
+    """
+    # Sort chronologically
+    games = games_df.sort_values(["date", "game_id"]).copy()
+
+    # Initialize all teams at 1500
+    all_teams = set(games["home_team_id"].unique()) | set(games["away_team_id"].unique())
+    elo = {team: ELO_MEAN for team in all_teams}
+
+    results = []
+    prev_season = None
+
+    for _, game in games.iterrows():
+        season = game["season"]
+        home_id = game["home_team_id"]
+        away_id = game["away_team_id"]
+
+        # Season boundary: regress toward mean
+        if prev_season is not None and season != prev_season:
+            for team in elo:
+                elo[team] = elo[team] + ELO_SEASON_REVERT * (ELO_MEAN - elo[team])
+
+        prev_season = season
+
+        # Pre-game ratings (what the model sees)
+        home_rating = elo.get(home_id, ELO_MEAN)
+        away_rating = elo.get(away_id, ELO_MEAN)
+
+        results.append({
+            "game_id": game["game_id"],
+            "home_elo": round(home_rating, 1),
+            "away_elo": round(away_rating, 1),
+            "diff_elo": round(home_rating - away_rating, 1),
+        })
+
+        # Update ratings if game has a result
+        home_score = game.get("home_score")
+        away_score = game.get("away_score")
+
+        if pd.notna(home_score) and pd.notna(away_score):
+            # Include home advantage in expected score
+            home_expected = _elo_expected(
+                home_rating + ELO_HOME_ADV, away_rating
+            )
+            home_actual = 1.0 if home_score > away_score else 0.0
+
+            k = ELO_K
+            if ELO_MOV_MULTIPLIER:
+                mov = abs(home_score - away_score)
+                elo_diff = abs(home_rating - away_rating)
+                k = k * _elo_mov_mult(mov, elo_diff)
+
+            # Update both teams
+            update = k * (home_actual - home_expected)
+            elo[home_id] = home_rating + update
+            elo[away_id] = away_rating - update
+
+    elo_df = pd.DataFrame(results)
+
+    # Summary stats
+    final_elos = sorted(elo.items(), key=lambda x: -x[1])
+    top3 = [f"team {t}: {r:.0f}" for t, r in final_elos[:3]]
+    bot3 = [f"team {t}: {r:.0f}" for t, r in final_elos[-3:]]
+    print(f"  Elo ratings computed for {len(results)} games")
+    print(f"    Top 3: {', '.join(top3)}")
+    print(f"    Bot 3: {', '.join(bot3)}")
+    print(f"    Elo spread: {final_elos[0][1]:.0f} to {final_elos[-1][1]:.0f}")
+
+    return elo_df
+
+
+def compute_team_projection_features(games_df):
+    """
+    Add team-level projected WAR from Marcel snapshots.
+
+    For each game, looks up the team's total projected hitting WAR,
+    pitching WAR, and combined WAR from the correct season's snapshot.
+    These are static preseason features that don't change game-to-game.
+
+    New features:
+    - home_team_proj_hit_war / away_team_proj_hit_war
+    - home_team_proj_pitch_war / away_team_proj_pitch_war
+    - home_team_proj_war / away_team_proj_war (total)
+    - diff_team_proj_war (home advantage in roster quality)
+    """
+    snapshot_dir = OUTPUT_DIR / "snapshots"
+
+    # Build team WAR lookup per season
+    # Key: (season, team_name) -> {hit_war, pitch_war, total_war}
+    team_war = {}
+    for year in [2023, 2024, 2025, 2026]:
+        h_path = snapshot_dir / f"marcel_hitters_{year}.csv"
+        p_path = snapshot_dir / f"marcel_pitchers_{year}.csv"
+        if not h_path.exists() or not p_path.exists():
+            continue
+
+        h_df = pd.read_csv(h_path)
+        p_df = pd.read_csv(p_path)
+
+        # Filter out free agents and apply WAR floor
+        h_df = h_df[h_df['current_team'] != 'Free Agent'].copy()
+        p_df = p_df[p_df['current_team'] != 'Free Agent'].copy()
+        h_df = h_df[h_df['proj_pa'] >= 100].copy()
+        p_df = p_df[p_df['proj_ip'] >= 30].copy()
+        h_df['proj_war'] = h_df['proj_war'].clip(lower=-1.5)
+        p_df['proj_war'] = p_df['proj_war'].clip(lower=-1.5)
+
+        hit_agg = h_df.groupby('current_team')['proj_war'].sum()
+        pitch_agg = p_df.groupby('current_team')['proj_war'].sum()
+
+        for team_name in set(hit_agg.index) | set(pitch_agg.index):
+            hw = hit_agg.get(team_name, 0)
+            pw = pitch_agg.get(team_name, 0)
+            team_war[(year, team_name)] = {
+                'hit_war': hw, 'pitch_war': pw, 'total_war': hw + pw,
+            }
+
+    # Need team_id -> team_name mapping
+    conn = sqlite3.connect(str(DB_PATH))
+    teams = pd.read_sql("SELECT id, name FROM teams", conn)
+    conn.close()
+    tid_to_name = dict(zip(teams['id'], teams['name']))
+
+    results = []
+    default_war = {'hit_war': 0, 'pitch_war': 0, 'total_war': 0}
+
+    for _, game in games_df.iterrows():
+        game_id = game['game_id']
+        season = game['season']
+        row = {'game_id': game_id}
+
+        for side in ['home', 'away']:
+            team_id = game[f'{side}_team_id']
+            team_name = tid_to_name.get(team_id, '')
+            tw = team_war.get((season, team_name), default_war)
+
+            row[f'{side}_team_proj_hit_war'] = round(tw['hit_war'], 1)
+            row[f'{side}_team_proj_pitch_war'] = round(tw['pitch_war'], 1)
+            row[f'{side}_team_proj_war'] = round(tw['total_war'], 1)
+
+        row['diff_team_proj_war'] = row['home_team_proj_war'] - row['away_team_proj_war']
+        row['diff_team_proj_hit_war'] = row['home_team_proj_hit_war'] - row['away_team_proj_hit_war']
+        row['diff_team_proj_pitch_war'] = row['home_team_proj_pitch_war'] - row['away_team_proj_pitch_war']
+
+        results.append(row)
+
+    print(f"    Team WAR features: {len(results)} games, "
+          f"{len(team_war)} team-season entries")
+    return pd.DataFrame(results)
+
+
+# ═══════════════════════════════════════════════════════════════
 # ASSEMBLY
 # ═══════════════════════════════════════════════════════════════
 
 def assemble_game_features(games_df, team_features, sp_features, bp_features,
                            lineup_features=None, projection_features=None,
                            rest_days_df=None, handedness_df=None,
-                           venue_splits_df=None):
+                           venue_splits_df=None, team_proj_features=None,
+                           elo_df=None, bp_avail_features=None,
+                           sp_rgs_features=None, weather_features=None,
+                           def_eff_features=None, barrel_features=None,
+                           statcast_bb_features=None):
     """Merge all feature layers into a single game-level matrix."""
 
     result = games_df[["game_id", "mlb_game_id", "date", "season",
@@ -1098,6 +1897,69 @@ def assemble_game_features(games_df, team_features, sp_features, bp_features,
         proj_cols = [c for c in projection_features.columns if c != 'game_id']
         result = result.merge(
             projection_features[['game_id'] + proj_cols],
+            on='game_id', how='left'
+        )
+
+    # --- Team projection features (Layer 5b) ---
+    if team_proj_features is not None and len(team_proj_features) > 0:
+        tp_cols = [c for c in team_proj_features.columns if c != 'game_id']
+        result = result.merge(
+            team_proj_features[['game_id'] + tp_cols],
+            on='game_id', how='left'
+        )
+
+    # --- Elo ratings ---
+    if elo_df is not None and len(elo_df) > 0:
+        result = result.merge(
+            elo_df[["game_id", "home_elo", "away_elo", "diff_elo"]],
+            on="game_id", how="left"
+        )
+
+    # --- SP Game Score (538 rGS) ---
+    if sp_rgs_features is not None and len(sp_rgs_features) > 0:
+        rgs_cols = [c for c in sp_rgs_features.columns if c != 'game_id']
+        result = result.merge(
+            sp_rgs_features[['game_id'] + rgs_cols],
+            on='game_id', how='left'
+        )
+
+    # --- Weather & park factor features ---
+    if weather_features is not None and len(weather_features) > 0:
+        wx_cols = [c for c in weather_features.columns if c != 'game_id']
+        result = result.merge(
+            weather_features[['game_id'] + wx_cols],
+            on='game_id', how='left'
+        )
+
+    # --- Defensive efficiency ---
+    if def_eff_features is not None and len(def_eff_features) > 0:
+        de_cols = [c for c in def_eff_features.columns if c != 'game_id']
+        result = result.merge(
+            def_eff_features[['game_id'] + de_cols],
+            on='game_id', how='left'
+        )
+
+    # --- Team barrel rate ---
+    if barrel_features is not None and len(barrel_features) > 0:
+        br_cols = [c for c in barrel_features.columns if c != 'game_id']
+        result = result.merge(
+            barrel_features[['game_id'] + br_cols],
+            on='game_id', how='left'
+        )
+
+    # --- Statcast batted ball quality (barrel %, pulled air %, pulled barrel %) ---
+    if statcast_bb_features is not None and len(statcast_bb_features) > 0:
+        sbb_cols = [c for c in statcast_bb_features.columns if c != 'game_id']
+        result = result.merge(
+            statcast_bb_features[['game_id'] + sbb_cols],
+            on='game_id', how='left'
+        )
+
+    # --- Bullpen availability ---
+    if bp_avail_features is not None and len(bp_avail_features) > 0:
+        bp_cols = [c for c in bp_avail_features.columns if c != 'game_id']
+        result = result.merge(
+            bp_avail_features[['game_id'] + bp_cols],
             on='game_id', how='left'
         )
 
@@ -1211,10 +2073,30 @@ def main():
     sp_features = compute_pitcher_rolling(pitchers, windows=SP_WINDOWS)
     print(f"  Generated {len(sp_features)} SP feature rows")
     
+    # Layer 2b: SP rolling Game Score (538's biggest signal)
+    sp_rgs_features = None
+    print("\n[4b/14] Computing SP Game Score (538 rGS)...")
+    try:
+        sp_rgs_features = compute_sp_game_score(pitchers, games)
+        if sp_rgs_features is not None and len(sp_rgs_features) > 0:
+            print(f"  Generated {len(sp_rgs_features)} SP Game Score rows")
+    except Exception as e:
+        print(f"  SP Game Score skipped: {e}")
+
     print("\n[5/7] Computing bullpen rolling stats...")
     bp_features = compute_bullpen_rolling(pitchers, games, windows=BP_WINDOWS)
     print(f"  Generated {len(bp_features)} bullpen feature rows")
-    
+
+    # Layer 3b: Bullpen availability/fatigue
+    bp_avail_features = None
+    print("\n[5b/14] Computing bullpen availability (fatigue)...")
+    try:
+        bp_avail_features = compute_bullpen_availability(pitchers, games)
+        if bp_avail_features is not None and len(bp_avail_features) > 0:
+            print(f"  Generated {len(bp_avail_features)} bullpen availability rows")
+    except Exception as e:
+        print(f"  Bullpen availability skipped: {e}")
+
     lineup_features = None
     hitters = None
     if not args.skip_lineup:
@@ -1235,22 +2117,42 @@ def main():
     projection_features = None
     print("\n[7/11] Computing projection features (Layer 5)...")
     try:
-        pitcher_map, hitter_map = load_projection_maps()
-        if pitcher_map and hitter_map:
+        pitcher_maps, hitter_maps = load_projection_maps()
+        if any(pitcher_maps.values()) and any(hitter_maps.values()):
             if hitters is None:
                 hitters = load_hitting_stats(conn)
             projection_features = compute_projection_features(
-                games, hitters, pitcher_map, hitter_map
+                games, hitters, pitcher_maps, hitter_maps
             )
             print(f"  Generated {len(projection_features)} projection feature rows")
         else:
-            print("  Skipped — no projection CSVs available")
+            print("  Skipped — no projection snapshots available")
     except Exception as e:
         print(f"  Projection features skipped: {e}")
 
+    # Layer 5b: Elo ratings
+    elo_df = None
+    print("\n[8/13] Computing Elo ratings...")
+    try:
+        elo_df = compute_elo_ratings(games)
+    except Exception as e:
+        print(f"  Elo ratings skipped: {e}")
+
+    # Layer 5c: Team-level projected WAR
+    team_proj_features = None
+    print("\n[9/13] Computing team projection features (Layer 5c)...")
+    try:
+        team_proj_features = compute_team_projection_features(games)
+        if team_proj_features is not None and len(team_proj_features) > 0:
+            print(f"  Generated {len(team_proj_features)} team projection rows")
+        else:
+            print("  Skipped — no team projection data")
+    except Exception as e:
+        print(f"  Team projection features skipped: {e}")
+
     # Layer 6a: Rest days (computed from game dates)
     rest_days_df = None
-    print("\n[8/11] Computing rest days (Layer 6a)...")
+    print("\n[10/13] Computing rest days (Layer 6a)...")
     try:
         rest_days_df = compute_rest_days(games)
     except Exception as e:
@@ -1258,7 +2160,7 @@ def main():
 
     # Layer 6b: Handedness matchups (platoon advantage)
     handedness_df = None
-    print("\n[9/11] Computing handedness features (Layer 6b)...")
+    print("\n[11/13] Computing handedness features (Layer 6b)...")
     try:
         if hitters is None:
             hitters = load_hitting_stats(conn)
@@ -1266,20 +2168,72 @@ def main():
     except Exception as e:
         print(f"  Handedness features skipped: {e}")
 
+    # Layer 8: Feature gaps (defensive efficiency, barrel rate)
+    def_eff_features = None
+    barrel_features = None
+    print("\n[12/16] Computing defensive efficiency (Layer 8a)...")
+    try:
+        if hitters is None:
+            hitters = load_hitting_stats(conn)
+        def_eff_features = compute_defensive_efficiency(pitchers, games, hitters)
+    except Exception as e:
+        print(f"  Defensive efficiency skipped: {e}")
+
+    print("\n[13/16] Computing team barrel rate (Layer 8b)...")
+    try:
+        if hitters is None:
+            hitters = load_hitting_stats(conn)
+        barrel_features = compute_team_barrel_rate(hitters, games)
+    except Exception as e:
+        print(f"  Team barrel rate skipped: {e}")
+
+    # Layer 8c: Statcast batted ball quality (barrels, pulled air, pulled barrels)
+    statcast_bb_features = None
+    print("\n[13b/16] Computing Statcast batted ball features (Layer 8c)...")
+    try:
+        bb_data = load_statcast_batted_balls(conn)
+        if not bb_data.empty:
+            statcast_bb_features = compute_statcast_batted_ball_features(bb_data, games)
+        else:
+            print("  No Statcast batted ball data (run backfill_statcast_batted_balls.py)")
+    except Exception as e:
+        print(f"  Statcast batted ball features skipped: {e}")
+
+    # Layer 7: Weather & park factor features
+    weather_features = None
+    print("\n[14/16] Computing weather & park factor features (Layer 7)...")
+    try:
+        sys.path.insert(0, str(Path(__file__).parent.parent))
+        from src.features.weather import compute_weather_features
+        ballparks_df = load_ballparks(conn)
+        if len(ballparks_df) > 0:
+            weather_features = compute_weather_features(games, ballparks_df)
+            print(f"  Generated {len(weather_features)} weather feature rows")
+        else:
+            print("  Skipped — no ballpark data (run populate_ballparks.py)")
+    except Exception as e:
+        print(f"  Weather features skipped: {e}")
+        import traceback
+        traceback.print_exc()
+
     # Layer 6c: Home/away venue splits
     venue_splits_df = None
-    print("\n[10/11] Computing home/away venue splits (Layer 6c)...")
+    print("\n[15/16] Computing home/away venue splits (Layer 6c)...")
     try:
         venue_splits_df = compute_home_away_splits(games)
     except Exception as e:
         print(f"  Venue splits skipped: {e}")
 
     # ---- Assemble ----
-    print("\n[11/11] Assembling game feature matrix...")
+    print("\n[16/16] Assembling game feature matrix...")
     game_features = assemble_game_features(
         games, team_features, sp_features, bp_features,
         lineup_features, projection_features,
-        rest_days_df, handedness_df, venue_splits_df
+        rest_days_df, handedness_df, venue_splits_df,
+        team_proj_features, elo_df, bp_avail_features,
+        sp_rgs_features, weather_features,
+        def_eff_features, barrel_features,
+        statcast_bb_features
     )
     
     if args.season:

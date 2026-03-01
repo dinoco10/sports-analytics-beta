@@ -1050,7 +1050,8 @@ def compute_pitcher_scores(pitcher_statcast, luck_filters, era_adj,
 # ═══════════════════════════════════════════════════════════════
 
 def project_pitcher(player_seasons, pitcher_statcast=None, pitch_metrics=None,
-                    league_avg_era=4.20, league_avg_fip=4.20):
+                    league_avg_era=4.20, league_avg_fip=4.20,
+                    projection_year=2026):
     """
     Marcel-style projection for a single pitcher, now with Statcast overlay.
 
@@ -1071,14 +1072,19 @@ def project_pitcher(player_seasons, pitcher_statcast=None, pitch_metrics=None,
     birth_date = player_seasons.iloc[0]['birth_date']
     role = player_seasons.iloc[-1]['role']  # Most recent role
 
-    # Age in 2026
+    # Age in projection year (parameterized for historical snapshots)
     if pd.notna(birth_date):
-        age_2026 = 2026 - pd.to_datetime(birth_date).year
+        age_2026 = projection_year - pd.to_datetime(birth_date).year
     else:
         age_2026 = 28  # Default assumption
 
-    # Marcel weights
-    year_weights = {2025: 5, 2024: 4, 2023: 3}
+    # Marcel weights — relative to projection year
+    # Most recent season gets 5, one year back gets 4, two years back gets 3
+    year_weights = {
+        projection_year - 1: 5,
+        projection_year - 2: 4,
+        projection_year - 3: 3,
+    }
 
     total_weight = 0
     weighted_era = 0
@@ -1177,11 +1183,30 @@ def project_pitcher(player_seasons, pitcher_statcast=None, pitch_metrics=None,
     # Also adjust FIP proportionally (same direction, slightly less magnitude)
     proj_fip += sc_era_adj * 0.6
 
-    # Projected IP
-    recent_ip = player_seasons[player_seasons['season'] == 2025]['ip'].sum()
-    if recent_ip == 0:
-        recent_ip = player_seasons['ip'].mean()
-    proj_ip = recent_ip * playing_time_adjustment(age_2026, role)
+    # Projected IP — Marcel 5/4/3 weighted average across available years
+    # Same logic as hitter PA: prevents a single injured/short season from
+    # crushing the projection (e.g., King 65 IP in 2025 → should be ~150).
+    ip_weights = {
+        projection_year - 1: 5, projection_year - 2: 4, projection_year - 3: 3,
+    }
+    weighted_ip_num = 0
+    weighted_ip_den = 0
+    for yr, wt in ip_weights.items():
+        yr_ip = player_seasons[player_seasons['season'] == yr]['ip'].sum()
+        if yr_ip > 0:
+            weighted_ip_num += yr_ip * wt
+            weighted_ip_den += wt
+    if weighted_ip_den > 0:
+        base_ip = weighted_ip_num / weighted_ip_den
+    else:
+        base_ip = player_seasons['ip'].mean()
+
+    # Floor by role: SP should project at least 100 IP, RP at least 30 IP
+    if role == 'SP':
+        base_ip = max(base_ip, 100) if base_ip > 50 else base_ip
+    elif role == 'RP':
+        base_ip = max(base_ip, 30) if base_ip > 15 else base_ip
+    proj_ip = base_ip * playing_time_adjustment(age_2026, role)
 
     # Pitcher WAR: based on FIP vs league average, scaled by innings
     league_fip = 4.20
@@ -1220,7 +1245,8 @@ def project_pitcher(player_seasons, pitcher_statcast=None, pitch_metrics=None,
     }
 
 
-def project_hitter(player_seasons, player_statcast=None, league_avg_woba=None):
+def project_hitter(player_seasons, player_statcast=None, league_avg_woba=None,
+                   projection_year=2026):
     """
     Marcel-style projection for a single hitter, now with Statcast overlay + fWAR.
 
@@ -1244,12 +1270,18 @@ def project_hitter(player_seasons, player_statcast=None, league_avg_woba=None):
     birth_date = player_seasons.iloc[0]['birth_date']
     position = player_seasons.iloc[-1].get('primary_position', 'DH')
 
+    # Age in projection year (parameterized for historical snapshots)
     if pd.notna(birth_date):
-        age_2026 = 2026 - pd.to_datetime(birth_date).year
+        age_2026 = projection_year - pd.to_datetime(birth_date).year
     else:
         age_2026 = 27
 
-    year_weights = {2025: 5, 2024: 4, 2023: 3}
+    # Marcel weights — relative to projection year
+    year_weights = {
+        projection_year - 1: 5,
+        projection_year - 2: 4,
+        projection_year - 3: 3,
+    }
 
     total_weight = 0
     weighted_woba = 0
@@ -1333,11 +1365,27 @@ def project_hitter(player_seasons, player_statcast=None, league_avg_woba=None):
     # Apply Statcast adjustment to get final projected wOBA
     statcast_adjusted_woba = round(proj_woba + sc_adj, 3)
 
-    # Projected PA
-    recent_pa = player_seasons[player_seasons['season'] == 2025]['pa'].sum()
-    if recent_pa == 0:
-        recent_pa = player_seasons['pa'].mean()
-    proj_pa = recent_pa * playing_time_adjustment(age_2026, 'hitter')
+    # Projected PA — Marcel 5/4/3 weighted average across available years
+    # Uses the same weighting philosophy as rate stats: recent years matter more,
+    # but a single injured season doesn't destroy the projection.
+    pa_weights = {
+        projection_year - 1: 5, projection_year - 2: 4, projection_year - 3: 3,
+    }
+    weighted_pa_num = 0
+    weighted_pa_den = 0
+    for yr, wt in pa_weights.items():
+        yr_pa = player_seasons[player_seasons['season'] == yr]['pa'].sum()
+        if yr_pa > 0:
+            weighted_pa_num += yr_pa * wt
+            weighted_pa_den += wt
+    if weighted_pa_den > 0:
+        base_pa = weighted_pa_num / weighted_pa_den
+    else:
+        base_pa = player_seasons['pa'].mean()
+
+    # Floor: regulars shouldn't project below 400 PA unless truly fringe
+    base_pa = max(base_pa, 400) if base_pa > 200 else base_pa
+    proj_pa = base_pa * playing_time_adjustment(age_2026, 'hitter')
 
     # ── wRC+ CALCULATION ──────────────────────────────────
     # wRC+ = how many runs a hitter creates relative to league average.
@@ -1426,10 +1474,14 @@ def run_projections(team_filter=None, player_filter=None):
     pitcher_sc_raw = load_pitcher_statcast_multi_year()
     pitch_metrics_raw = load_pitcher_pitch_metrics()
 
-    # Get current rosters
+    # Get current rosters — captures team AND position from live API
+    # The API position is more accurate than the DB primary_position field,
+    # which can be stale (e.g., Pittsburgh has 7 "1B" when players actually
+    # play SS, 3B, C). The API reflects current roster configuration.
     print("\nFetching current 2026 rosters...")
     teams_data = api_get("teams", {"sportId": 1, "season": 2026})
-    roster_map = {}  # mlb_player_id -> current_team
+    roster_map = {}       # mlb_player_id -> current_team
+    roster_position = {}  # mlb_player_id -> current position (from API)
 
     for t in teams_data.get("teams", []):
         roster = api_get(f"teams/{t['id']}/roster", {"rosterType": "40Man", "season": 2026})
@@ -1437,9 +1489,13 @@ def run_projections(team_filter=None, player_filter=None):
             pid = p.get("person", {}).get("id")
             if pid:
                 roster_map[pid] = t["name"]
+                pos = p.get("position", {}).get("abbreviation", "")
+                if pos:
+                    roster_position[pid] = pos
         time.sleep(0.2)
 
     print(f"  Players on 2026 rosters: {len(roster_map)}")
+    print(f"  Players with API positions: {len(roster_position)}")
 
     # Project pitchers WITH Statcast overlay
     print("\nProjecting pitchers (with Statcast adjustment)...")
@@ -1473,6 +1529,11 @@ def run_projections(team_filter=None, player_filter=None):
         proj = project_hitter(group, player_statcast=player_sc)
         if proj:
             proj['current_team'] = roster_map.get(pid, 'Free Agent')
+            # Override position with live API position if available
+            # (DB primary_position can be stale — API reflects current roster)
+            api_pos = roster_position.get(pid)
+            if api_pos and api_pos not in ('P', 'SP', 'RP', 'TWP'):
+                proj['position'] = api_pos
             hitter_projections.append(proj)
             if not player_sc.empty:
                 statcast_hits += 1

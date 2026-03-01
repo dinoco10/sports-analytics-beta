@@ -17,7 +17,18 @@ data/features/*
 
 # Database files
 *.db
+*.db-journal
 *.sqlite3
+
+# Odds data (large Excel/JSON files)
+data/odds/
+
+# Research (external repos, not part of project)
+research/
+
+# Temp/artifacts
+nul
+train_output.txt
 
 # Python
 __pycache__/
@@ -30,6 +41,7 @@ build/
 # IDE
 .vscode/
 .idea/
+.claude/
 *.swp
 
 # OS

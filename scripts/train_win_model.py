@@ -60,11 +60,15 @@ FEATURES_PATH = Path(__file__).parent.parent / "data" / "features" / "game_featu
 MODELS_DIR = Path(__file__).parent.parent / "models"
 
 # ===================================================================
-# PRUNED FEATURE SET — top 43 by LightGBM split importance
+# PRUNED FEATURE SET — 47 features, curated by ablation
 # ===================================================================
-# Started at 82 features, pruned to 35 (PR #15), then added 5 handedness
-# features + 3 venue split features for a total of 43.
-# Log loss: 0.6729 → 0.6633 (-96bp).
+# 42 base + 2 Elo + 3 SP Game Score (538 rGS) - 2 pruned noise + 2 park + 1 weather = 48.
+# Log loss: 0.6667 (5-seed avg).
+# rGS adds -4bp; pruning 3 noisy features saves -3bp; park factors -2.5bp; BFI -5.7bp.
+# Dropped: home_proj_sp_war (<1bp), diff_venue_wpct (-1.4bp noise),
+#          home_ivb_x_same_hand (-2.8bp noise).
+# Tested & rejected: def_eff (+9.1bp diff, -1.6bp h/a — not worth complexity).
+# Tested & rejected: game_temperature (+1.9bp alone; -4.2bp with BFI but dilutes signal).
 
 PRUNED_FEATURES = [
     # Projections (strongest signal)
@@ -78,7 +82,9 @@ PRUNED_FEATURES = [
     "home_proj_sp_sc_era",
     "home_proj_sp_fip",
     "diff_proj_sp_sust",
-    "home_proj_sp_war",
+    # Elo ratings (trajectory signal — -17.8bp improvement)
+    "home_elo",
+    "away_elo",
     # Team rolling
     "diff_pyth_t30",
     "diff_pyth_t14",
@@ -110,14 +116,24 @@ PRUNED_FEATURES = [
     # Handedness matchups (Layer 6 — ~80bp improvement)
     "home_platoon_adv",
     "away_platoon_adv",
-    # Arsenal x handedness interactions
+    # Arsenal x handedness interactions (velo survives, IVB pruned)
     "away_velo_x_same_hand",
     "home_velo_x_same_hand",
-    "home_ivb_x_same_hand",
-    # Venue-specific splits (home-only / away-only rolling win%)
+    # Venue-specific splits (home/away venue wpct only — diff was noise)
     "home_venue_wpct",
     "away_venue_wpct",
-    "diff_venue_wpct",
+    # SP Game Score (538's rGS — rolling avg game score per SP)
+    # Ablation: home/away/diff = -4bp; diff_sp_rgs_adj hurts (+10bp)
+    "home_sp_rgs",
+    "away_sp_rgs",
+    "diff_sp_rgs",
+    # Park factors (Statcast, 100-scale converted to multiplier)
+    # Ablation: both runs+HR = -2.5bp; runs alone = noise
+    "park_factor_runs",
+    "park_factor_hr",
+    # Weather composite (physics-based ball flight distance index, 1-10 scale)
+    # Ablation: BFI alone = -5.7bp; raw temp hurts (+1.9bp); BFI pre-computes the physics
+    "ball_flight_index",
 ]
 
 def get_feature_layers():
@@ -155,12 +171,14 @@ def get_feature_layers():
                          "proj_lineup_woba", "proj_lineup_bb_score"],
         },
         6: {
-            "name": "+ Rest/Handedness/Splits",
-            "description": "Rest days, platoon advantage, arsenal x handedness interactions, venue splits",
+            "name": "+ Elo/Handedness/Splits",
+            "description": "Elo ratings, platoon advantage, arsenal x handedness interactions, venue splits",
             "patterns": ["rest_days", "platoon_adv",
                          "sp_same_hand_pct",
                          "velo_x_same_hand", "ivb_x_same_hand",
-                         "venue_wpct", "venue_rs", "venue_ra"],
+                         "venue_wpct", "venue_rs", "venue_ra",
+                         "elo",
+                         "bp_ip_last", "bp_pitches_last", "bp_fatigue_last"],
         },
     }
     return layers
@@ -337,6 +355,7 @@ def main():
     parser.add_argument("--all-layers", action="store_true", help="Train each layer incrementally")
     parser.add_argument("--pruned", action="store_true", help="Use pruned feature set (best log loss)")
     parser.add_argument("--max-depth", type=int, default=2, help="Tree max depth")
+    parser.add_argument("--train-start", type=int, default=2021, help="First training season (default 2021, skips COVID 2020)")
     parser.add_argument("--shap", action="store_true", help="Run SHAP analysis")
     parser.add_argument("--save", action="store_true", help="Save best model")
     args = parser.parse_args()
@@ -356,9 +375,10 @@ def main():
     df["date"] = pd.to_datetime(df["date"])
     print(f"  Loaded {len(df)} games, seasons: {sorted(df['season'].unique())}")
 
-    # Time-based split
+    # Time-based split (skip COVID 2020 by default)
     test_season = args.test_season
-    train_seasons = [s for s in df["season"].unique() if s < test_season]
+    train_start = args.train_start
+    train_seasons = [s for s in df["season"].unique() if train_start <= s < test_season]
 
     if not train_seasons:
         print(f"\nNo training data before season {test_season}!")
@@ -440,8 +460,15 @@ def main():
             meta_path = MODELS_DIR / "win_probability_meta.json"
             with open(meta_path, "w") as f:
                 json.dump(meta, f, indent=2)
+            # Save feature medians for NaN imputation in live pipeline
+            medians = {col: float(X_train[col].median()) for col in feature_cols}
+            medians_path = MODELS_DIR / "feature_medians.json"
+            with open(medians_path, "w") as f:
+                json.dump(medians, f, indent=2)
+
             print(f"\n  Model saved to: {model_path}")
             print(f"  Metadata saved to: {meta_path}")
+            print(f"  Medians saved to: {medians_path}")
 
         print(f"\n{'=' * 70}")
         print(f"  LOG LOSS: {results['log_loss']:.6f}")
@@ -558,8 +585,16 @@ def main():
         with open(meta_path, "w") as f:
             json.dump(meta, f, indent=2)
 
+        # Save feature medians for NaN imputation in live pipeline
+        X_train_best = train_df[best_features].copy()
+        medians = {col: float(X_train_best[col].median()) for col in best_features}
+        medians_path = MODELS_DIR / "feature_medians.json"
+        with open(medians_path, "w") as f:
+            json.dump(medians, f, indent=2)
+
         print(f"\n  Model saved to: {model_path}")
         print(f"  Metadata saved to: {meta_path}")
+        print(f"  Medians saved to: {medians_path}")
 
     # Summary table
     if len(all_results) > 1:
