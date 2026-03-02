@@ -116,7 +116,7 @@ def store_box(session, game_db_id, game_date, mlb_gid):
     return pc, hc
 
 def backfill_season(season, start_date=None):
-    starts = {2024: date(2024, 3, 20), 2025: date(2025, 3, 27)}
+    starts = {2024: date(2024, 3, 20), 2025: date(2025, 3, 27), 2026: date(2026, 3, 26)}
     if not start_date: start_date = starts.get(season, date(season, 3, 20))
     end_date = min(date(season, 11, 5), date.today() - timedelta(days=1))
     print(f"\n{'='*70}\nBACKFILLING {season}: {start_date} to {end_date}\n{'='*70}")
